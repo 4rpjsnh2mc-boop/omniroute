@@ -8,8 +8,23 @@ bash scripts/ad-hoc/osint/install-osint-tools.sh                # PyPI + apt
 bash scripts/ad-hoc/osint/install-osint-tools.sh --with-github  # + theHarvester, SpiderFoot
 ```
 
-Контейнер облачной сессии одноразовый: в новой сессии скрипт нужно запустить заново или прописать
-в «Setup script» окружения.
+Повторный запуск безопасен: установленное пропускается. При ошибке скрипт показывает её причину
+и завершается с кодом 1, полный лог — `/var/log/osint-install.log`.
+
+### Автоустановка в каждой новой сессии
+
+Контейнер облачной сессии одноразовый. Чтобы набор ставился сам, вставьте в «Setup script»
+окружения (меню окружения → «Изменить облачную среду»):
+
+```bash
+f=omniroute/scripts/ad-hoc/osint/install-osint-tools.sh
+if [ -f "$f" ]; then bash "$f" --with-github || true; fi
+```
+
+- Setup script запускается в папке, где лежат репозитории, поэтому путь начинается с `omniroute/`.
+- `|| true` обязателен: упавший setup script не даёт сессии запуститься.
+- Скрипт лежит в ветке `claude/dazzling-mendel-e6u574`. Пока ветка не влита в основную, в сессиях
+  на основной ветке файла нет, и проверка `[ -f ]` просто пропустит установку.
 
 ## Что установлено (проверено 2026-11-05)
 
@@ -38,7 +53,8 @@ bash scripts/ad-hoc/osint/install-osint-tools.sh --with-github  # + theHarvester
   (пример ниже).
 - `trafilatura` не умеет HTTP-прокси — страницу скачивает `curl`, текст достаёт trafilatura.
 - `maigret` нужен `--proxy "$HTTPS_PROXY" -n 8`; часть сайтов всё равно отвечает 403/429.
-- `theHarvester` запускать с `-p` (прокси прописывает установщик в `~/.theHarvester/proxies.yaml`).
+- `theHarvester` сам не читает `$HTTPS_PROXY`, а порт прокси меняется даже посреди сессии.
+  Установщик ставит обёртку, которая при каждом запуске прописывает текущий прокси и флаг `-p`.
 - `web.archive.org` обрывает соединения из облака — архив сайтов смотрит Claude через веб-поиск.
 - `spiderfoot` запускается, но модули, которым нужен DNS, в облаке ничего не находят; пробный
   скан teboil.ru вернул только сам домен. Полноценно он работает на своём компьютере.
@@ -47,7 +63,7 @@ bash scripts/ad-hoc/osint/install-osint-tools.sh --with-github  # + theHarvester
 
 ```bash
 # Почты и поддомены компании
-theHarvester -d konkurent.ru -b hackertarget,rapiddns,duckduckgo -l 200 -p
+theHarvester -d konkurent.ru -b hackertarget,rapiddns,duckduckgo -l 200
 
 # Пассивная разведка по домену, отчёт в CSV
 spiderfoot -s konkurent.ru -u passive -o csv > konkurent.csv
