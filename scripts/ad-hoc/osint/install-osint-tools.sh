@@ -56,27 +56,34 @@ step "pipx: shodan (фикс setuptools)" pipx inject -q shodan "setuptools<81"
 step "venv /opt/osint-py: telethon dadata requests" bash -c \
   'python3 -m venv /opt/osint-py && /opt/osint-py/bin/pip install -q telethon dadata requests'
 
-# 4. Код и бинарники с GitHub. По умолчанию выключено: в сессиях Claude
-#    загрузку чужого кода с GitHub нужно разрешить явно. Этот блок
-#    в сессии 2026-11-05 не запускался и не проверялся.
+# 4. Инструменты разведки по организациям с GitHub (по умолчанию выключено).
+#    theHarvester требует Python 3.14, SpiderFoot — старые зависимости,
+#    поэтому интерпретаторы берёт uv.
 if ((WITH_GITHUB)); then
-  step "theHarvester (почты и поддомены компании)" \
-    pipx install -q --python 3.14 --fetch-python=missing \
-    "git+https://github.com/laramies/theHarvester.git"
-  step "telepathy (OSINT по Telegram-каналам)" \
-    pipx install -q --python 3.10 --fetch-python=missing telepathy
-  step "phoneinfoga (информация по номеру телефона)" bash -c '
-    d=$(mktemp -d) &&
-    curl -fsSL -o "$d/pi.tgz" \
-      https://github.com/sundowndev/phoneinfoga/releases/latest/download/phoneinfoga_Linux_x86_64.tar.gz &&
-    tar -xzf "$d/pi.tgz" -C "$d" &&
-    install -m755 "$d/phoneinfoga" /usr/local/bin/phoneinfoga &&
-    rm -rf "$d"'
-  step "spiderfoot (веб-интерфейс, 200+ источников)" bash -c '
+  export PATH="/root/.local/bin:$PATH"
+  export UV_TOOL_DIR=/opt/uv-tools
+  export UV_TOOL_BIN_DIR=/usr/local/bin
+  command -v uv >/dev/null 2>&1 || step "uv" pip3 install -q uv
+
+  step "theHarvester (почты, поддомены, хосты домена)" \
+    uv tool install -q --python 3.14 "git+https://github.com/laramies/theHarvester.git"
+  # theHarvester не читает HTTPS_PROXY: прокси сессии прописывается в его конфиг,
+  # запуск с флагом -p.
+  if [[ -n "${HTTPS_PROXY:-}" ]]; then
+    mkdir -p ~/.theHarvester
+    printf 'http:\n    - %s\n' "${HTTPS_PROXY#http://}" >~/.theHarvester/proxies.yaml
+  fi
+
+  step "spiderfoot (230 модулей, CLI и веб-интерфейс)" bash -c '
     rm -rf /opt/spiderfoot &&
     git clone -q --depth 1 https://github.com/smicallef/spiderfoot.git /opt/spiderfoot &&
-    python3 -m venv /opt/spiderfoot/venv &&
-    /opt/spiderfoot/venv/bin/pip install -q -r /opt/spiderfoot/requirements.txt'
+    uv venv -q --python 3.11 /opt/spiderfoot/venv &&
+    uv pip install -q --python /opt/spiderfoot/venv/bin/python -r /opt/spiderfoot/requirements.txt'
+  cat >/usr/local/bin/spiderfoot <<'EOF'
+#!/bin/sh
+cd /opt/spiderfoot && exec ./venv/bin/python sf.py "$@"
+EOF
+  chmod 755 /usr/local/bin/spiderfoot
 fi
 
 echo
