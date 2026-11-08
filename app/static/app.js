@@ -80,6 +80,13 @@ function parseDeadline(text) {
   } else return "";
   if (y < 100) y += 2000;
   const p2 = (n) => String(n).padStart(2, "0");
+  // «14:00 (МСК+4)» — местное время заказчика: переводим в московское (14:00 МСК+4 = 10:00 МСК)
+  const tz = t.match(/мск\s*([+−-])\s*(\d{1,2})/);
+  if (tz && m[4]) {
+    const shift = (tz[1] === "+" ? 1 : -1) * Number(tz[2]);
+    const u = new Date(Date.UTC(y, mo - 1, d, hh - shift, mm));
+    y = u.getUTCFullYear(); mo = u.getUTCMonth() + 1; d = u.getUTCDate(); hh = u.getUTCHours(); mm = u.getUTCMinutes();
+  }
   return `${y}-${p2(mo)}-${p2(d)}T${p2(hh)}:${p2(mm)}`;
 }
 // Время в тендерах московское: «2026-11-13T06:11» → секунды UTC
@@ -962,7 +969,13 @@ function renderSteps() {
 /* загрузка с площадки */
 function parseDays(s) {
   const m = String(s || "").match(/(\d{1,4})\s*(?:\(?[а-я ]*\)?\s*)?(календарн|рабоч)?[а-я]*\s*дн/i);
-  if (!m) return null;
+  if (!m) {
+    // «Сроки поставки: 30.11.2026» — считаем дни от сегодня
+    const dt = String(s || "").match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+    if (!dt) return null;
+    const days = Math.ceil((Date.UTC(+dt[3], +dt[2] - 1, +dt[1]) - Date.now()) / 86400000);
+    return days > 0 ? days : null;
+  }
   const n = Number(m[1]);
   return m[2] && /рабоч/i.test(m[2]) ? Math.ceil(n * 1.4) : n;
 }
@@ -1223,6 +1236,8 @@ function renderRisks() {
   if (f.unload) add("warn", "Разгрузка силами поставщика: заложите грузчиков.", f.unload.quote);
   if (f.multiaddr) add("warn", "Поставка партиями или по нескольким адресам: доставка обойдётся дороже.", f.multiaddr.quote);
   if (f.penalty) add("warn", "В проекте контракта есть штрафы и пени: прочитайте условия.", f.penalty.quote);
+  if (f.packaging) add("warn", "Есть требования к таре или способу поставки (налив, евротара, бочки): учтите тару и доставку в цене.", f.packaging.quote);
+  if (f.rebid) add("warn", "Повторный этап торгов или переторжка: прошлые этапы не устроили заказчика, ожидайте сильного торга по цене.", f.rebid.quote);
   const ts = mskTs(d.meta.deadlineAt);
   if (ts && ts - Date.now() / 1000 < 2 * 86400 && ts > Date.now() / 1000) add("bad", "До окончания подачи меньше 2 дней.");
   if (!(num(d.nmck) > 0)) add("warn", "НМЦ не указана: побеждает, скорее всего, самая низкая цена.");

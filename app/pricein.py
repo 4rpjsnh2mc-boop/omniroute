@@ -443,6 +443,7 @@ YANDEX_API = "https://cloud-api.yandex.net/v1/disk/public/resources/download?pub
 
 # ---------------------------------------------------------------- закупка со скриншотов, фото, PDF и Word
 
+NAME_HEAD = r"наименован|товар|позици|предмет|объект\w* закупки"
 QTY_HEAD_RE = re.compile(r"кол-?\s?во|количеств|объ[её]м", re.I)
 PRICE_HEAD_RE = re.compile(r"цена", re.I)
 SUM_HEAD_RE = re.compile(r"сумм|стоимост", re.I)
@@ -469,8 +470,8 @@ def items_from_text(text):
     out, order, misses, last, pending = [], None, 0, None, ""
     for line in lines:
         low = line.lower()
-        if order is None or (re.search(r"наименован|товар|позици", low) and QTY_HEAD_RE.search(low)):
-            if re.search(r"наименован|товар|позици|предмет", low) and QTY_HEAD_RE.search(low):
+        if order is None or (re.search(NAME_HEAD, low) and QTY_HEAD_RE.search(low)):
+            if re.search(NAME_HEAD, low) and QTY_HEAD_RE.search(low):
                 cols = [(QTY_HEAD_RE.search(low), "qty"), (PRICE_HEAD_RE.search(low), "price"), (SUM_HEAD_RE.search(low), "sum")]
                 order = [k for m, k in sorted((c for c in cols if c[0]), key=lambda c: c[0].start())]
                 misses, last = 0, None
@@ -481,6 +482,10 @@ def items_from_text(text):
         if re.match(r"^(итого|всего)", low.strip()):
             order = None
             continue
+        tail_unit = ""
+        mu = re.match(r"^(.*?\d)\s*(" + UNIT_WORDS + r")\.?$", st, re.I)  # «МАСЛО И-40А   14300 кг»
+        if mu and len(re.findall(r"[A-Za-zА-Яа-яЁё]", mu.group(1))) >= 3:
+            st, tail_unit = mu.group(1), mu.group(2)
         head, nums = _strip_tail_numbers(st, len(order))
         if not nums:
             if last is not None and st[:1].islower() and len(st) < 150:
@@ -498,6 +503,7 @@ def items_from_text(text):
             cand = parts[1].translate(LATIN_LOOKALIKE) if len(parts[1]) <= 4 else parts[1]
             if UNIT_RE.match(cand):
                 unit, head = cand, parts[0]
+        unit = unit or tail_unit
         name = P.clean_name(head.strip(" |,;"))
         if pending and name[:1].islower():
             name = P.clean_name(pending + " " + name)

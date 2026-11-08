@@ -217,6 +217,7 @@ FIELDS = {
         r"окончани\w* при[её]ма предложений",
         r"подать заявку до",
         r"срок подачи заявок",
+        r"дата и время окончания",  # подпись перенесена: «Дата и время окончания / подачи заявок»
     ],
     "place": [
         r"адрес\w* мест\w* поставки",  # раньше общих: «Место поставки» бывает и шапкой таблицы позиций
@@ -227,10 +228,10 @@ FIELDS = {
         r"место доставки",
     ],
     "appSec": [r"(размер )?обеспечени\w* заявк\w*"],
-    "conSec": [r"(размер )?обеспечени\w* исполнени\w*( контракта| договора)?", r"обеспечени\w* договора"],
+    "conSec": [r"(размер )?обеспечени\w* исполнени\w*( контракта| договора)?", r"обеспечени\w* договора", r"обеспечени\w* контракта"],
     "advance": [r"размер аванса", r"\bаванс\w*", r"предоплат\w*", r"условия оплаты"],
     "payment": [r"условия оплаты", r"срок оплаты", r"порядок оплаты", r"сроки оплаты", r"оплата"],
-    "contractTerm": [r"срок исполнения контракта", r"срок поставки", r"срок выполнения работ", r"срок исполнения договора"],
+    "contractTerm": [r"срок исполнения контракта", r"сроки? поставки", r"срок выполнения работ", r"срок исполнения договора"],
 }
 
 
@@ -330,7 +331,7 @@ def items_from_tables(tables):
                 continue
             name_i = _idx(h, r"^наименован")
             if name_i is None:
-                name_i = _idx(h, r"^(позици|товар|описани|предмет)")
+                name_i = _idx(h, r"^(позици|товар|описани|предмет|информаци\w* об объект|объект\w* закупки)")
             qty_i = _idx(h, r"^(кол-?во|количеств|объ[её]м)")
             if name_i is None or qty_i is None or name_i == qty_i:
                 continue
@@ -348,9 +349,13 @@ def items_from_tables(tables):
                     continue
                 if info_i is not None and r[info_i] and r[info_i].lower() not in name.lower():
                     name = f"{name} ({norm(r[info_i])[:140]})"
+                unit = norm(r[unit_i])[:30] if unit_i is not None else ""
+                if not unit:  # «14300 кг» — единица в ячейке количества
+                    mu = re.search(r"\d\s*([A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё²³0-9./]{0,9})\.?\s*$", r[qty_i])
+                    unit = mu.group(1) if mu else ""
                 out.append({
                     "name": name[:240],
-                    "unit": norm(r[unit_i])[:30] if unit_i is not None else "",
+                    "unit": unit,
                     "qty": qty,
                     "nmckUnit": money_value(r[price_i]) if price_i is not None else None,
                 })
@@ -513,6 +518,16 @@ def payment_days(v):
     return round(n * 1.4) if m.group(2) and not m.group(2).startswith("календ") else n
 
 
+ORG_FORM_RE = re.compile(r"(Общество|Акционерн|Публичн|Федеральн|Государственн|Муниципальн|Индивидуальн|Автономн|Бюджетн|Казённ|Казенн|"
+                         r"(?<![А-ЯЁA-Z])(?:ООО|АО|ПАО|ЗАО|ОАО|НАО|ИП|ГК|ФГУП|ФГБУ|ГБУ|МУП|ГУП|МБУ|МКУ|ГКУ|ФКУ)(?![А-ЯЁA-Z]))")
+
+
+def clean_org(s):
+    """««у Общество с …» → «Общество с …»: значок рядом с названием распознаётся мусором."""
+    m = ORG_FORM_RE.search(s or "")
+    return s[m.start():] if m and m.start() <= 6 else (s or "")
+
+
 def extract(pages, url):
     """pages: список (url, html). Возвращает словарь с полями закупки, позициями и документами."""
     lines, tables, links, title = [], [], [], ""
@@ -565,6 +580,10 @@ def extract(pages, url):
         org = next((l for l in lines[:200] if re.match(r"^(ООО|АО|ПАО|ЗАО|ОАО|НАО|ИП|ГК|ФГУП|ФГБУ|ГБУ|МУП|ГУП)\s+[«\"A-ZА-ЯЁ]", l)
                     and len(l) < 160 and not re.search(r"©|\(c\)|все права|площадк", l, re.I)), "")  # не подвал сайта
         customer = norm(org)
+    customer = clean_org(customer)
+    if not norm(subject) and items:  # заголовка нет: предмет по позициям
+        names = [i["name"] for i in items[:3]]
+        subject = ", ".join(names) + (f" и ещё {len(items) - 3}" if len(items) > 3 else "")
     return {
         "flags": flags(full),
         "inn": find_inn(customer, full[:20000]),
@@ -619,6 +638,8 @@ FLAG_RULES = [
     ("unload", r"разгрузк\w+\s+(силами|за\s+сч[её]т)\s+поставщик|погрузочно-?разгрузочн", True),
     ("multiaddr", r"(по\s+(следующим\s+)?адресам|адреса\s+поставки|согласно\s+графику\s+поставк|партиями|по\s+заявкам\s+заказчика)", True),
     ("penalty", r"(штраф|пен[ия])\w*\s+в\s+размере", True),
+    ("packaging", r"евротар|еврокуб|наливом|\bналив\b|в\s+бочках|бочк[аи]\s+\d|канистр|в\s+таре\s+производител|тара\s+(возвратн|невозвратн|поставщик)", True),
+    ("rebid", r"\d+-?й\s+этап\s+торгов|переторжк|повторн\w+\s+(торг|закупк|процедур)", True),
 ]
 
 
@@ -795,7 +816,7 @@ def normalize_url(url):
 # ---------------------------------------------------------------- текст со скриншотов, PDF и буфера обмена
 
 CELL_SPLIT_RE = re.compile(r"\t|\s*\|\s*|\s{2,}")
-HEAD_NAME_RE = re.compile(r"^(наименован|товар|позици|описани|предмет)", re.I)
+HEAD_NAME_RE = re.compile(r"^(наименован|товар|позици|описани|предмет|информаци\w* об объект|объект\w* закупки)", re.I)
 HEAD_QTY_RE = re.compile(r"^(кол-?во|количеств|объ[её]м)", re.I)
 
 
@@ -824,6 +845,10 @@ def _align(row, header, name_i):
     return left + [name] + tail
 
 
+def _pairs_html(labels, values):
+    return "<table>" + "".join(f"<tr><td>{html.escape(a)}</td><td>{html.escape(b)}</td></tr>" for a, b in zip(labels, values)) + "</table>"
+
+
 def text_to_html(text):
     """Текст (распознанный скриншот, PDF, копия страницы) → простой HTML: строки со столбцами
     становятся таблицами, остальное абзацами. Дальше его разбирает обычный extract()."""
@@ -836,10 +861,20 @@ def text_to_html(text):
             out.append("<table>" + "".join("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in r) + "</tr>" for r in table) + "</table>")
         table, header, name_i = None, None, None
 
+    skip = set()
     for i, line in enumerate(lines):
-        if not line.strip():
+        if not line.strip() or i in skip:
             continue
         cells = _cells(line)
+        if 2 <= len(cells) <= 6 and not table and all(len(c) < 45 and not re.search(r"\d", c) for c in cells) \
+                and sum(bool(LABELS_RX.search(c.lower())) for c in cells) >= 2:
+            j = next((k for k in range(i + 1, min(i + 3, len(lines))) if lines[k].strip()), None)
+            vals = _cells(lines[j]) if j is not None else []
+            if len(vals) == len(cells):  # «Цена контракта  Обеспечение заявки» / «не установлена  не требуется»
+                close()
+                out.append(_pairs_html(cells, vals))
+                skip.add(j)
+                continue
         if len(cells) >= 2:
             low = [c.lower() for c in cells]
             is_head = any(HEAD_NAME_RE.search(c) for c in low) and any(HEAD_QTY_RE.search(c) for c in low)

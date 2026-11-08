@@ -30,6 +30,26 @@ class TenderFromScreenshotsTest(unittest.TestCase):
         self.assertEqual(got, {(400.0, 560.0), (120.0, 2300.0), (90.0, 700.0), (12.0, 64000.0)})
         self.assertIn(("Арматура А500С 12 мм", "т"), {(i["name"], i["unit"]) for i in info["items"]})
 
+    def test_tenderpro_screenshot(self):
+        """Тендер Про: подписи столбцами («Цена контракта / Обеспечение…»), подпись срока на двух строках,
+        позиция «МАСЛО И-40А … 14300 кг» с единицей после количества, значок у заказчика."""
+        if not (shutil.which("tesseract") and shutil.which("convert")):
+            self.skipTest("нет tesseract или imagemagick")
+        with open(os.path.join(HERE, "fixtures", "tenderpro.png"), "rb") as f:
+            info = PI.tender_from_parts([PI.page_of("скриншот.png", f.read())])
+        self.assertEqual(info["number"], "1264766")
+        self.assertEqual(info["customer"], 'Общество с ограниченной ответственностью "Пикалевский глиноземный завод"')
+        self.assertEqual(info["items"], [{"name": "МАСЛО И-40А", "unit": "кг", "qty": 14300.0, "nmckUnit": None}])
+        self.assertEqual(info["subject"], "МАСЛО И-40А")
+        self.assertTrue(info["deadline"].startswith("10.11.2026 в 14:00"))
+        self.assertIn("МСК+4", info["deadline"])
+        self.assertEqual(info["contractTerm"], "30.11.2026")
+        self.assertIn("Пикалево", info["place"])
+        self.assertIsNone(info["nmck"])
+        self.assertEqual((info["appSecPct"], info["conSecPct"]), (0.0, 0.0))
+        self.assertTrue(info["flags"]["packaging"]["value"])
+        self.assertTrue(info["flags"]["rebid"]["value"])
+
     def test_ocr_rows_with_glued_columns(self):
         text = ("№   Наименование товара   Ед. изм. Количество Цена за ед. Сумма\n"
                 "1 Цемент М500 Д0, мешок 50 кг шт   400   560,00   224 000,00\n"
