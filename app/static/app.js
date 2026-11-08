@@ -67,6 +67,40 @@ async function loadPrices() {
 
 /* ---------- налоги и расчёт ---------- */
 const LAWS = { "44": "44-ФЗ", "223": "223-ФЗ", commercial: "Коммерческая" };
+const STAGES = [["check", "Проверить тендер"], ["quotes", "Запросить цены у поставщиков"], ["calc", "Рассчитать цену"], ["upload", "Подать заявку на площадке"], ["result", "Узнать итоги"]];
+const nextStage = (d) => { const st = d.stages || {}; const s = STAGES.find(([k]) => !st[k]); return s ? s[1] : "Всё сделано"; };
+const MONTHS = { янв: 1, фев: 2, мар: 3, апр: 4, май: 5, мая: 5, июн: 6, июл: 7, авг: 8, сен: 9, окт: 10, ноя: 11, дек: 12 };
+function parseDeadline(text) {
+  const t = String(text || "").toLowerCase();
+  let m = t.match(/(\d{1,2})[./](\d{1,2})[./](\d{2,4})(?:[^\d]{1,8}(\d{1,2}):(\d{2}))?/);
+  let y, mo, d, hh = 23, mm = 59;
+  if (m) { d = +m[1]; mo = +m[2]; y = +m[3]; if (m[4]) { hh = +m[4]; mm = +m[5]; } }
+  else if ((m = t.match(/(\d{1,2})\s+([а-я]{3})[а-я.]*\s+(\d{4})(?:[^\d]{1,8}(\d{1,2}):(\d{2}))?/)) && MONTHS[m[2]]) {
+    d = +m[1]; mo = MONTHS[m[2]]; y = +m[3]; if (m[4]) { hh = +m[4]; mm = +m[5]; }
+  } else return "";
+  if (y < 100) y += 2000;
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${y}-${p2(mo)}-${p2(d)}T${p2(hh)}:${p2(mm)}`;
+}
+// Время в тендерах московское: «2026-11-13T06:11» → секунды UTC
+const mskTs = (v) => { const m = String(v || "").match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/); return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 3, +m[5]) / 1000 : null; };
+const tsMsk = (ts) => { const d = new Date((ts + 3 * 3600) * 1000); const p2 = (n) => String(n).padStart(2, "0"); return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}T${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}`; };
+const fmtMsk = (ts) => { const v = tsMsk(ts); return `${v.slice(8, 10)}.${v.slice(5, 7)}.${v.slice(0, 4)} ${v.slice(11)} МСК`; };
+function leftText(ts) {
+  if (!ts) return "";
+  const s = ts - Date.now() / 1000;
+  if (s <= 0) return "срок прошёл";
+  const dd = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600);
+  return dd ? `осталось ${dd} дн. ${hh} ч.` : `осталось ${hh} ч. ${Math.floor((s % 3600) / 60)} мин.`;
+}
+const urgency = (ts) => { if (!ts) return ""; const s = ts - Date.now() / 1000; return s <= 0 ? "bad" : s < 2 * 86400 ? "bad" : s < 5 * 86400 ? "warn" : "neutral"; };
+function downloadFile(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
 const STATUSES = { draft: "Расчёт", submitted: "Подана заявка", won: "Выиграли", lost: "Проиграли", skipped: "Отказались" };
 const REGIMES = { osno: "ОСНО", usn6: "УСН «доходы» 6%", usn15: "УСН «доходы минус расходы» 15%" };
 const USN_VAT = { 0: "Без НДС (освобождение)", 5: "НДС 5% без вычета", 7: "НДС 7% без вычета", 22: "НДС 22% с вычетом" };
@@ -101,7 +135,8 @@ function baseOf(d) {
 function calcAt(b, P) {
   const vat = b.tax.vat / 100, a = b.a;
   const R = P / (1 + vat);
-  const disc = b.nmck > 0 ? (1 - P / b.nmck) * 100 : 0;
+  let disc = b.nmck > 0 ? (1 - P / b.nmck) * 100 : 0;
+  if (Math.abs(disc) < 0.005) disc = 0;
   const antidump = b.d.meta.law === "44" && b.nmck > 0 && disc >= 25 - 1e-9;
   const secAmt = ((P * num(a.conSecPct)) / 100) * (antidump ? 1.5 : 1);
   const days = num(a.contractDays) + 30;
@@ -227,11 +262,12 @@ function newData() {
   const s = SETTINGS || {};
   return {
     v: 1,
-    meta: { number: "", customer: "", subject: "", deadline: "", place: "", url: "", law: "44", contractTerm: "" },
+    meta: { number: "", customer: "", subject: "", deadline: "", deadlineAt: "", place: "", url: "", law: "44", contractTerm: "" },
     nmck: 0, items: [], supplierVat: s.supplierVat !== false, delivery: 0, other: 0, overheadPct: s.overheadPct ?? 5,
     adv: { appSecPct: 0, appDays: 20, conSecPct: 0, secMethod: "bg", bgRatePct: s.bgRatePct ?? 3, contractDays: 30, paymentDays: 10, advancePct: 0, moneyRatePct: s.moneyRatePct ?? 18, platformFee: 0 },
     tax: { ...(s.tax || { regime: "osno", usnVat: 0, usnRate: 6, profitRate: 25 }) },
     targetPct: s.targetPct ?? 10, bid: { mode: "target" }, status: "draft", missingDocs: [],
+    note: "", stages: {}, important: false, flags: {}, inn: "",
   };
 }
 let pendingImport = null;
@@ -251,9 +287,11 @@ async function viewList() {
       </form>
       <p class="hint" style="margin-top:8px">Сервер откроет страницу закупки, заполнит позиции и условия и скачает документы.</p>
     </div>
+    <div id="soon"></div>
     <div class="stats" id="stats"></div>
+    <div class="row" id="flt" style="margin-bottom:12px"></div>
     <div class="card" style="padding:0"><div class="table-wrap" style="border:0">
-      <table class="list" style="min-width:760px"><thead><tr><th>Тендер</th><th>Подача до</th><th class="r">НМЦК</th><th class="r">Наша цена</th><th class="r">Маржа</th><th>Статус</th></tr></thead><tbody id="t-body"><tr><td colspan="6" class="muted">Загрузка…</td></tr></tbody></table>
+      <table class="list" style="min-width:900px"><thead><tr><th>Тендер</th><th>Подача до</th><th class="r">Закупка</th><th class="r">Наша цена</th><th class="r">Маржа</th><th>Следующий шаг</th><th>Статус</th></tr></thead><tbody id="t-body"><tr><td colspan="7" class="muted">Загрузка…</td></tr></tbody></table>
     </div></div>`;
   const create = async (url) => {
     const r = await api("POST", "/api/tenders", { title: url ? "Загрузка…" : "Новый тендер", data: newData() });
@@ -271,30 +309,73 @@ async function viewList() {
     $("#w-copy").onclick = () => copyText(personalLink(), $("#w-link"));
     $("#w-close").onclick = () => { JUST_JOINED = false; viewList(); };
   }
-  const { tenders } = await api("GET", "/api/tenders");
-  const body = $("#t-body");
-  if (!tenders.length) body.innerHTML = `<tr><td colspan="6" class="muted" style="padding:18px">Тендеров пока нет. Вставьте ссылку на закупку выше.</td></tr>`;
-  else body.innerHTML = tenders.map((t) => {
-    const m = t.margin;
-    const mp = m === null || m === undefined ? "—" : `<span class="pill ${m <= 0 ? "bad" : m >= num(SETTINGS.targetPct) ? "good" : "warn"}">${pct(m)}</span>`;
-    return `<tr class="clickable" data-id="${t.id}"><td><div class="t-title">${esc(t.title || "Без названия")}</div><div class="t-meta">${esc([t.number, t.customer].filter(Boolean).join(" · "))}</div></td>
-      <td class="small">${esc(t.deadline || "")}</td><td class="r">${t.nmck ? rub(t.nmck) : "—"}</td><td class="r">${t.price ? rub(t.price) : "—"}</td><td class="r">${mp}</td><td>${esc(STATUSES[t.status] || "Расчёт")}</td></tr>`;
-  }).join("");
-  $$("#t-body tr[data-id]").forEach((tr) => tr.addEventListener("click", () => { location.hash = "#/t/" + tr.dataset.id; }));
+  const [{ tenders }, { reminders }] = await Promise.all([api("GET", "/api/tenders"), api("GET", "/api/reminders")]);
+  LIST = tenders;
+  const soon = reminders.filter((r) => !r.sent && r.at - Date.now() / 1000 < 3 * 86400).slice(0, 5);
+  const hot = tenders.filter((t) => t.deadline_ts && t.deadline_ts > Date.now() / 1000 && t.deadline_ts - Date.now() / 1000 < 3 * 86400 && ["draft", "submitted"].includes(t.status));
+  $("#soon").innerHTML = soon.length || hot.length ? `<div class="card"><div class="card-h"><h2>Ближайшие сроки</h2></div><div class="docs-list">
+      ${hot.map((t) => `<a class="doc" href="#/t/${t.id}"><span class="name"><b>${esc(t.title)}</b><br><span class="small muted">Окончание подачи: ${esc(fmtMsk(t.deadline_ts))}</span></span><span class="pill ${urgency(t.deadline_ts)}">${esc(leftText(t.deadline_ts))}</span></a>`).join("")}
+      ${soon.map((r) => `<a class="doc" href="#/t/${r.tender_id}"><span class="name">⏰ ${esc(r.text || "Напоминание")}<br><span class="small muted">${esc(r.title)} · ${esc(fmtMsk(r.at))}</span></span></a>`).join("")}</div></div>` : "";
+  const f = LIST_FILTER;
+  $("#flt").innerHTML = `
+    <div class="inp grow"><input id="flt-q" placeholder="Поиск по названию, номеру, заказчику" value="${esc(f.q)}" aria-label="Поиск"></div>
+    <div class="inp"><select id="flt-stage" aria-label="Следующий шаг"><option value="">Любой шаг</option>${STAGES.map(([, l]) => `<option${f.stage === l ? " selected" : ""}>${esc(l)}</option>`).join("")}<option${f.stage === "Всё сделано" ? " selected" : ""}>Всё сделано</option></select></div>
+    <div class="inp"><select id="flt-status" aria-label="Статус"><option value="">Любой статус</option>${Object.entries(STATUSES).map(([k, v]) => `<option value="${k}"${f.status === k ? " selected" : ""}>${v}</option>`).join("")}</select></div>
+    <div class="inp"><select id="flt-when" aria-label="Срок"><option value="">Любой срок</option><option value="hot"${f.when === "hot" ? " selected" : ""}>Горящие (до 3 дней)</option><option value="active"${f.when === "active" ? " selected" : ""}>Приём заявок идёт</option><option value="past"${f.when === "past" ? " selected" : ""}>Срок прошёл</option></select></div>
+    <label class="check"><input type="checkbox" id="flt-imp"${f.important ? " checked" : ""}> <span>Только важные</span></label>`;
+  const apply = () => {
+    f.q = $("#flt-q").value.trim().toLowerCase(); f.stage = $("#flt-stage").value; f.status = $("#flt-status").value;
+    f.when = $("#flt-when").value; f.important = $("#flt-imp").checked;
+    try { localStorage.setItem("tender-filter", JSON.stringify(f)); } catch (e) { /* не страшно */ }
+    renderList();
+  };
+  $("#flt").oninput = apply; $("#flt").onchange = apply;
+  renderList();
   const cnt = (s) => tenders.filter((t) => t.status === s).length;
   const won = tenders.filter((t) => t.status === "won");
   const decided = cnt("won") + cnt("lost");
   const st = (v, k) => `<div class="stat"><div class="v">${v}</div><div class="k">${k}</div></div>`;
   $("#stats").innerHTML = [
-    st(tenders.length, "расчётов"),
+    st(tenders.length, "тендеров"),
     st(cnt("submitted") + decided, "подано заявок"),
     st(won.length, "выиграно"),
     st(decided ? pct((won.length / decided) * 100, 0) : "—", "доля побед"),
-    st(won.length ? rub(won.reduce((a, t) => a + (t.price || 0), 0)) : "—", "сумма выигранных"),
+    st(won.length ? rub(won.reduce((a, t) => a + (t.profit || 0), 0)) : "—", "прибыль с побед"),
   ].join("");
 }
-async function copyText(text, input) {
-  try { await navigator.clipboard.writeText(text); toast("Ссылка скопирована"); }
+let LIST = [];
+let LIST_FILTER = (() => { try { return { q: "", stage: "", status: "", when: "", important: false, ...JSON.parse(localStorage.getItem("tender-filter") || "{}") }; } catch (e) { return { q: "", stage: "", status: "", when: "", important: false }; } })();
+function renderList() {
+  const f = LIST_FILTER, nowS = Date.now() / 1000;
+  let rows = LIST.filter((t) => {
+    if (f.q && ![t.title, t.number, t.customer].join(" ").toLowerCase().includes(f.q)) return false;
+    if (f.stage && (t.stage || "Проверить тендер") !== f.stage) return false;
+    if (f.status && t.status !== f.status) return false;
+    if (f.important && !t.important) return false;
+    if (f.when === "hot" && !(t.deadline_ts && t.deadline_ts > nowS && t.deadline_ts - nowS < 3 * 86400)) return false;
+    if (f.when === "active" && !(t.deadline_ts && t.deadline_ts > nowS)) return false;
+    if (f.when === "past" && !(t.deadline_ts && t.deadline_ts <= nowS)) return false;
+    return true;
+  });
+  rows = rows.sort((a, b) => {
+    const fa = a.deadline_ts && a.deadline_ts > nowS ? a.deadline_ts : 9e12, fb = b.deadline_ts && b.deadline_ts > nowS ? b.deadline_ts : 9e12;
+    return fa - fb || b.updated - a.updated;
+  });
+  const body = $("#t-body");
+  if (!LIST.length) { body.innerHTML = `<tr><td colspan="7" class="muted" style="padding:18px">Тендеров пока нет. Вставьте ссылку на закупку выше.</td></tr>`; return; }
+  if (!rows.length) { body.innerHTML = `<tr><td colspan="7" class="muted" style="padding:18px">Под фильтр ничего не подходит.</td></tr>`; return; }
+  body.innerHTML = rows.map((t) => {
+    const m = t.margin;
+    const mp = m === null || m === undefined ? "—" : `<span class="pill ${m <= 0 ? "bad" : m >= num(SETTINGS.targetPct) ? "good" : "warn"}">${pct(m)}</span>`;
+    const dl = t.deadline_ts ? `${esc(fmtMsk(t.deadline_ts))}<br><span class="pill ${urgency(t.deadline_ts)}">${esc(leftText(t.deadline_ts))}</span>` : esc(t.deadline || "—");
+    return `<tr class="clickable" data-id="${t.id}"><td><div class="t-title">${t.important ? "★ " : ""}${esc(t.title || "Без названия")}</div><div class="t-meta">${esc([t.number, t.customer].filter(Boolean).join(" · "))}</div></td>
+      <td class="small">${dl}</td><td class="r">${t.cost ? rub(t.cost) : "—"}</td><td class="r">${t.price ? rub(t.price) : "—"}</td><td class="r">${mp}</td>
+      <td><span class="pill neutral">${esc(t.stage || "Проверить тендер")}</span></td><td class="small">${esc(STATUSES[t.status] || "Расчёт")}</td></tr>`;
+  }).join("");
+  $$("#t-body tr[data-id]").forEach((tr) => tr.addEventListener("click", () => { location.hash = "#/t/" + tr.dataset.id; }));
+}
+async function copyText(text, input, okMsg = "Ссылка скопирована") {
+  try { await navigator.clipboard.writeText(text); toast(okMsg); }
   catch (e) { if (input) { input.focus(); input.select(); } toast("Выделите ссылку и скопируйте вручную"); }
 }
 
@@ -307,6 +388,7 @@ function summaryOf() {
     title: d.meta.subject || d.meta.number || "Без названия", number: d.meta.number, url: d.meta.url, customer: d.meta.customer,
     status: d.status, nmck: num(d.nmck) || null, price: c && c.P > 0 ? round2(c.P) : null,
     profit: c && last.has ? round2(c.net) : null, margin: c && last.has && isFinite(c.margin) ? round2(c.margin) : null, deadline: d.meta.deadline,
+    deadlineTs: mskTs(d.meta.deadlineAt), stage: nextStage(d), important: !!d.important, cost: last && last.has ? round2(last.b.gross) : null,
   };
 }
 async function saveNow() {
@@ -356,8 +438,10 @@ async function viewTender(id) {
   d.tax = { ...base.tax, ...(d.tax || {}) };
   d.items = Array.isArray(d.items) ? d.items : [];
   d.status = tender.status || d.status || "draft";
-  T = { id, data: d, dirty: false };
-  leaveHook = async () => { clearInterval(docsTimer); await saveNow(); T = null; };
+  d.stages = d.stages || {}; d.flags = d.flags || {}; d.note = d.note || "";
+  if (!d.meta.deadlineAt && d.meta.deadline) d.meta.deadlineAt = parseDeadline(d.meta.deadline);
+  T = { id, data: d, dirty: false, docFlags: {}, market: null };
+  leaveHook = async () => { clearInterval(docsTimer); clearInterval(marketTimer); await saveNow(); T = null; };
 
   app.innerHTML = `
   <div class="row" style="justify-content:space-between;margin-bottom:12px">
@@ -368,6 +452,26 @@ async function viewTender(id) {
   </div>
   <div class="layout">
     <div>
+      <section class="card" id="work">
+        <div class="card-h"><h2>Работа с тендером</h2><label class="check"><input type="checkbox" id="f-important" data-k="important" data-t="bool"> <span>★ Важный</span></label></div>
+        <div class="row" style="align-items:flex-end">
+          <div class="field"><label for="f-meta-deadlineAt">Окончание подачи (МСК)</label><div class="inp"><input type="datetime-local" id="f-meta-deadlineAt" data-k="meta.deadlineAt" data-t="text"></div></div>
+          <span class="pill" id="dl-left"></span>
+          <button class="btn sm" type="button" id="ics">В календарь</button>
+        </div>
+        <div class="stages" id="stages" style="margin-top:12px"></div>
+        <div style="margin-top:14px"><h3>Напоминания</h3><div class="docs-list" id="rem-list"></div>
+          <form class="row" id="rem-f" style="margin-top:8px">
+            <div class="inp"><input type="datetime-local" id="rem-at" aria-label="Когда напомнить (МСК)" required></div>
+            <div class="inp grow"><input id="rem-text" placeholder="О чём напомнить" value="Подать заявку" aria-label="Текст напоминания"></div>
+            <button class="btn sm" type="submit">Добавить</button>
+            <button class="btn sm" type="button" id="rem-day">За день до окончания</button>
+          </form>
+          <p class="hint" id="rem-hint" style="margin-top:6px"></p></div>
+        <div class="field" style="margin-top:14px"><label for="f-note">Заметка</label><textarea id="f-note" data-k="note" data-t="text" rows="3" placeholder="Например: поставщик даёт скидку от 5 т, позвонить заказчику по срокам"></textarea></div>
+        <div class="row" style="margin-top:10px"><button class="btn sm" type="button" id="note-copy">Скопировать сводку</button><span class="hint">Тендер, цены закупки и продажи, маржа после налогов, срок и следующий шаг одним текстом</span></div>
+      </section>
+
       <section class="card">
         <div class="card-h"><h2>Закупка</h2><span class="muted small" id="imp-status"></span></div>
         <form class="row" id="imp-f" style="margin-bottom:14px">
@@ -386,6 +490,11 @@ async function viewTender(id) {
         </div>
       </section>
 
+      <section class="card" id="risk-card">
+        <div class="card-h"><h2>Условия и подводные камни</h2><span class="hint">Из страницы закупки, документов и расчёта</span></div>
+        <ul class="risks" id="risks"></ul>
+      </section>
+
       <section class="card">
         <div class="card-h"><h2>Позиции</h2><span class="hint" id="cost-hint"></span></div>
         <div class="table-wrap"><table class="items"><thead><tr>
@@ -397,6 +506,14 @@ async function viewTender(id) {
           <span class="small" id="items-total"></span>
         </div>
         <datalist id="dl-prices">${PRICES.map((p) => `<option value="${esc(p.name)}">${p.cost ? esc(nf2.format(p.cost) + " ₽ / " + (p.unit || "ед.")) : ""}</option>`).join("")}</datalist>
+      </section>
+
+      <section class="card" id="mk-card">
+        <div class="card-h"><h2>Цены конкурентов и похожие закупки</h2>
+          <div class="row"><button class="btn sm primary" type="button" id="mk-run">Найти в ЕИС</button></div></div>
+        <p class="hint">Цены за единицу из заключённых контрактов 44-ФЗ: по региону тендера и по всей России, кто поставлял, история закупок заказчика. Только открытые данные zakupki.gov.ru. Решение о цене принимаете вы.</p>
+        <div id="mk-job" class="small muted" style="margin-top:6px"></div>
+        <div id="mk-out" style="margin-top:10px"></div>
       </section>
 
       <section class="card">
@@ -452,6 +569,25 @@ async function viewTender(id) {
   syncTaxFields();
   recalc();
   loadDocs();
+  renderStages();
+  loadReminders();
+  loadMarket();
+  $("#ics").onclick = exportIcs;
+  $("#note-copy").onclick = () => copyText(noteText(), null, "Сводка скопирована");
+  $("#mk-run").onclick = runMarket;
+  $("#rem-f").onsubmit = async (e) => {
+    e.preventDefault();
+    const at = mskTs($("#rem-at").value);
+    if (!at) return toast("Укажите дату и время");
+    try { await api("POST", `/api/tenders/${T.id}/reminders`, { at, text: $("#rem-text").value.trim() }); loadReminders(); toast("Напоминание добавлено"); }
+    catch (ex) { toast(ex.message); }
+  };
+  $("#rem-day").onclick = async () => {
+    const dl = mskTs(T.data.meta.deadlineAt);
+    if (!dl) return toast("Сначала укажите окончание подачи");
+    try { await api("POST", `/api/tenders/${T.id}/reminders`, { at: dl - 86400, text: "Завтра окончание подачи. Проверить и подать заявку" }); loadReminders(); toast("Напомню за день до окончания"); }
+    catch (ex) { toast(ex.message); }
+  };
 
   $("#imp-f").addEventListener("submit", (e) => { e.preventDefault(); runImport($("#f-meta-url").value.trim()); });
   $("#t-del").addEventListener("click", (e) => confirmInline(e.currentTarget, "Удалить тендер?", async () => {
@@ -486,7 +622,7 @@ function fillFields() {
 function onField(e) {
   const el = e.target;
   if (!el.dataset || !el.dataset.k || !T) return;
-  if (e.type === "change" && el.dataset.t !== "sel" && el.dataset.t !== "bool") {
+  if (e.type === "change" && el.dataset.t !== "sel" && el.dataset.t !== "bool" && !/date/.test(el.type)) {
     if (el.dataset.t === "num") el.value = fmtIn(getPath(T.data, el.dataset.k), true);
     return;
   }
@@ -495,6 +631,9 @@ function onField(e) {
   setPath(T.data, el.dataset.k, t === "num" ? num(el.value) : t === "bool" ? el.checked : el.value);
   if (el.dataset.k.startsWith("tax.")) syncTaxFields();
   if (el.dataset.k === "supplierVat") updateItemCells();
+  if (el.dataset.k === "meta.deadlineAt") renderStages();
+  if (el.dataset.k === "meta.deadline" && !T.data.meta.deadlineAt) { T.data.meta.deadlineAt = parseDeadline(el.value); $("#f-meta-deadlineAt").value = T.data.meta.deadlineAt; renderStages(); }
+  if (el.dataset.k === "note") { changed(); return; }
   recalc();
   changed();
 }
@@ -521,7 +660,7 @@ function renderItems() {
       <td><input data-f="unit" value="${esc(x.unit)}" aria-label="Ед."></td>
       <td><input data-f="qty" class="n" inputmode="decimal" value="${fmtIn(x.qty)}" aria-label="Количество"></td>
       <td><input data-f="nmckUnit" class="n" inputmode="decimal" value="${fmtIn(x.nmckUnit)}" aria-label="Цена НМЦК за единицу"></td>
-      <td><input data-f="cost" class="n" inputmode="decimal" value="${fmtIn(x.cost)}" aria-label="Наша цена за единицу"><span class="hint-price" data-o="hint"></span></td>
+      <td><input data-f="cost" class="n" inputmode="decimal" value="${fmtIn(x.cost)}" aria-label="Наша цена за единицу"><span class="hint-price" data-o="hint"></span><span class="hint-price" data-o="analog"></span></td>
       <td class="r" data-o="sum"></td>
       <td class="r" data-o="m"></td>
       <td><button class="icon" type="button" data-act="del" aria-label="Удалить позицию">×</button></td>
@@ -554,6 +693,15 @@ function renderItems() {
     }
   };
   tb.onclick = (e) => {
+    const ab = e.target.closest('[data-act="analog"]');
+    if (ab) return showAnalogs(ab.closest("tr"));
+    const pick = e.target.closest("[data-pick]");
+    if (pick) {
+      const x = T.data.items.find((i) => i.id === pick.closest("tr").previousElementSibling.dataset.id);
+      const p = PRICES.find((q) => String(q.id) === pick.dataset.pick);
+      if (x && p) { x.cost = p.cost; x.analog = p.name; if (!x.unit) x.unit = p.unit; renderItems(); recalc(); changed(); toast("Цена аналога подставлена"); }
+      return;
+    }
     const b = e.target.closest('[data-act="del"]');
     if (!b) return;
     const id = b.closest("tr").dataset.id;
@@ -564,6 +712,31 @@ function renderItems() {
   };
 }
 function priceFor(x) { return priceIndex.get((x.name || "").trim().toLowerCase()); }
+const STOPW = new Set("для из на по под при без или и в с со к от до шт кг т м л гост ту марка тип вид товар поставка количестве".split(" "));
+const toks = (s) => (String(s || "").toLowerCase().replace(/ё/g, "е").match(/[a-zа-я]+|\d+(?:[.,]\d+)?(?:-\d+(?:[.,]\d+)?)?/g) || [])
+  .filter((w) => !STOPW.has(w) && (w.length > 2 || /\d/.test(w))).map((w) => (/^\d/.test(w) ? w : w.slice(0, 7)));
+function sim(a, b) {
+  const base = String(a || "").split(/[(,;]/)[0];
+  const ta = [...new Set([...(toks(base).length ? toks(base) : toks(a)), ...toks(a).filter((w) => /^\d/.test(w))])].slice(0, 8);
+  const tb = new Set(toks(b));
+  if (!ta.length) return 0;
+  const hit = ta.filter((w) => tb.has(w)).length;
+  return tb.has(ta[0]) ? hit / ta.length : (hit / ta.length) * 0.5;
+}
+function analogsMode() { const f = { ...(T.data.flags || {}), ...(T.docFlags || {}) }; return f.analogs ? f.analogs.value : ""; }
+function analogCandidates(x) {
+  return PRICES.filter((p) => p.cost > 0).map((p) => ({ p, s: sim(x.name, p.name) })).filter((o) => o.s >= 0.34).sort((a, b) => b.s - a.s).slice(0, 5).map((o) => o.p);
+}
+function showAnalogs(tr) {
+  const nx = tr.nextElementSibling;
+  if (nx && nx.classList.contains("an-row")) { nx.remove(); return; }
+  const x = T.data.items.find((i) => i.id === tr.dataset.id);
+  const row = document.createElement("tr");
+  row.className = "an-row";
+  row.innerHTML = `<td colspan="8"><div class="small" style="padding:4px 6px">${analogsMode() === "allowed" ? "Заказчик допускает эквивалент. " : "Допускается ли эквивалент, проверьте в документации. "}Похожее из вашего прайса:</div>
+    <div class="docs-list" style="margin:4px 6px 8px">${analogCandidates(x).map((p) => `<div class="doc"><span class="name">${esc(p.name)}<br><span class="small muted">${esc(p.unit || "ед.")} · ${rub2(p.cost)}${p.note ? " · " + esc(p.note) : ""}</span></span><button class="btn sm" type="button" data-pick="${p.id}">Взять</button></div>`).join("")}</div></td>`;
+  tr.after(row);
+}
 function updateItemCells() {
   const d = T.data;
   $("#cost-hint").textContent = d.supplierVat ? "Наши цены с НДС 22%, как в счетах поставщиков" : "Наши цены без НДС";
@@ -582,6 +755,14 @@ function updateItemCells() {
     $('[data-f="cost"]', tr).classList.toggle("missing", q > 0 && !(c > 0));
     const p = priceFor(x);
     $('[data-o="hint"]', tr).textContent = p && p.cost > 0 && Math.abs(p.cost - c) > 0.005 ? `прайс: ${nf2.format(p.cost)}` : "";
+    const an = $('[data-o="analog"]', tr);
+    let ah = "";
+    if (x.analog) ah = `<span class="pill neutral" title="${esc(x.analog)}">аналог</span>`;
+    else if (!p && !(c > 0) && analogsMode() !== "forbidden") {
+      const cand = analogCandidates(x);
+      ah = cand.length ? `<button class="btn link" type="button" data-act="analog">аналоги из прайса: ${cand.length}</button>` : "";
+    }
+    if (an.dataset.h !== ah) { an.innerHTML = ah; an.dataset.h = ah; }
   }
   const goods = d.items.reduce((a, x) => a + num(x.qty) * num(x.cost), 0);
   const nm = d.items.reduce((a, x) => a + num(x.qty) * num(x.nmckUnit), 0);
@@ -663,9 +844,59 @@ function renderSummary() {
   if (cur.antidump) warns.push("Снижение 25% и больше: обеспечение исполнения ×1,5 (ст. 37 44-ФЗ).");
   if (r.has && r.tgDisc !== null && r.tgDisc < 0) warns.push(`Целевая маржа недостижима в рамках НМЦК: при НМЦК маржа ${pct(r.nm.margin)}.`);
   if (b.tax.kind === "diff") warns.push("УСН 15%: по итогам года налог не меньше 1% от всех доходов.");
-  $("#s-body").innerHTML = `${rows.length ? `<table class="bd">${rows.join("")}</table>` : ""}
+  const rec = recommend(r);
+  if (rec) warns.unshift(...rec.warn);
+  $("#s-body").innerHTML = `${rec ? `<div class="rec"><div class="sub">Рекомендуемая цена</div><div class="rec-v">${rub(rec.price)}</div><div class="sub">${esc(rec.why)}</div>
+      ${rec.comp ? `<div class="sub" style="margin-top:4px">Конкуренты за лот: ${rec.comp.region ? `регион ≈ ${rub(rec.comp.region)}` : "регион —"} · РФ ≈ ${rec.comp.rf ? rub(rec.comp.rf) : "—"}</div>` : ""}
+      <button class="btn sm" type="button" id="rec-use" style="margin-top:8px">Поставить эту цену</button></div>` : ""}
+    ${rows.length ? `<table class="bd">${rows.join("")}</table>` : ""}
     <div class="sub">Чистая маржа: <b style="color:var(--panel-ink)">${r.has ? pct(cur.margin) : "—"}</b> · Безубыточно от: <b style="color:var(--panel-ink)">${r.be ? rub(r.be) : "—"}</b>${r.beDisc !== null ? (r.beDisc >= 0 ? ` (снижение до ${pct(r.beDisc)})` : ` (выше НМЦК на ${pct(-r.beDisc)})`) : ""}</div>
     ${warns.length ? `<ul class="warns">${warns.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}`;
+  const ru = $("#rec-use");
+  if (ru) ru.onclick = () => { T.data.bid = { mode: "price", price: rec.price }; recalc(); changed(); toast("Цена поставлена. Окончательное решение за вами"); };
+  renderRisks();
+}
+function competitorLot(useRegion) {
+  const mk = T.market;
+  if (!mk || !mk.items) return null;
+  const byId = new Map(mk.items.map((i) => [i.id, i]));
+  let lot = 0, covered = 0, nmckCovered = 0, nmckLot = 0, ratioNum = 0;
+  const items = T.data.items.filter((x) => num(x.qty) > 0);
+  for (const x of items) {
+    const st = byId.get(x.id);
+    const s = st && (useRegion ? (st.region && st.region.n >= 2 ? st.region : null) : st.rf);
+    nmckLot += num(x.qty) * num(x.nmckUnit);
+    if (!s) continue;
+    lot += num(x.qty) * s.median; covered++;
+    if (num(x.nmckUnit) > 0) { nmckCovered += num(x.qty) * num(x.nmckUnit); ratioNum += num(x.qty) * s.median; }
+  }
+  if (!covered) return null;
+  if (covered === items.length) return lot;
+  const nmck = num(T.data.nmck);
+  if (nmck > 0 && nmckLot > 0 && nmckCovered / nmckLot >= 0.5) return nmck * (ratioNum / nmckCovered);
+  return null;
+}
+function recommend(r) {
+  if (!r.has) return null;
+  const minM = num(SETTINGS.minMarginPct ?? 3);
+  const floor = solve(r.b, (c) => c.margin - minM);
+  const comp = { region: competitorLot(true), rf: competitorLot(false) };
+  const ref = comp.region || comp.rf;
+  const nmck = r.b.nmck;
+  const warn = [];
+  let price, why;
+  if (ref) { price = ref * 0.99; why = `На 1% ниже цен конкурентов ${comp.region ? "в регионе" : "по России"}.`; }
+  else if (r.tg) { price = r.tg; why = `По целевой марже ${pct(r.target, 0)}. Цен конкурентов пока нет: нажмите «Найти в ЕИС».`; }
+  else return null;
+  if (nmck > 0 && price > nmck) { price = nmck; why += " Ограничено НМЦК."; }
+  if (floor && price < floor) {
+    if (nmck > 0 && floor > nmck) { warn.push(`Даже при НМЦК маржа ниже минимальной (${pct(minM, 0)}). Участвовать невыгодно.`); }
+    else { price = floor; why = `Конкуренты дешевле. Ниже ${rub(floor)} опускаться нельзя: маржа станет меньше ${pct(minM, 0)}.`; }
+  }
+  const c = calcAt(r.b, price);
+  why += ` Маржа ${pct(c.margin)}, чистая прибыль ${rub(c.net)}.`;
+  price = nmck > 0 ? Math.min(Math.round(price), Math.floor(nmck)) : Math.round(price);
+  return { price, why, comp: comp.region || comp.rf ? comp : null, warn };
 }
 function renderSteps() {
   const r = last, card = $("#steps-card");
@@ -719,8 +950,11 @@ async function runImport(url) {
       });
     }
     d.missingDocs = info.missingDocs || [];
+    d.flags = info.flags || {};
+    d.inn = info.inn || d.inn || "";
+    if (info.deadline) { d.meta.deadlineAt = parseDeadline(info.deadline) || d.meta.deadlineAt; }
     d.bid = { mode: "target" };
-    fillFields(); renderItems(); recalc(); changed(); await saveNow();
+    fillFields(); renderItems(); recalc(); renderStages(); changed(); await saveNow();
     $("#imp-btn").textContent = "Обновить с площадки";
     const found = info.items ? info.items.length : 0;
     st.textContent = `Загружено: ${found} ${plural(found, "позиция", "позиции", "позиций")}, документов найдено: ${info.docs.length}`;
@@ -750,6 +984,8 @@ async function loadDocs() {
     if (!b) return;
     try { await api("DELETE", `/api/tenders/${id}/docs/${b.dataset.doc}`); loadDocs(); } catch (ex) { toast(ex.message); }
   };
+  T.docFlags = r.flags || {};
+  renderRisks(); updateItemCells();
   const job = r.job;
   $("#docs-job").textContent = job && job.running ? `Скачиваю документы с площадки: ${job.done} из ${job.total}…` : "";
   clearInterval(docsTimer);
@@ -769,6 +1005,148 @@ async function uploadDocs(e) {
     } catch (ex) { toast(`${f.name}: ${ex.message}`); }
   }
   loadDocs();
+}
+
+/* ---------- работа с тендером: этапы, напоминания, календарь, сводка ---------- */
+let marketTimer = 0;
+function renderStages() {
+  const d = T.data, st = d.stages;
+  $("#stages").innerHTML = STAGES.map(([k, l]) => `<label class="check stage${st[k] ? " done" : ""}"><input type="checkbox" data-stage="${k}"${st[k] ? " checked" : ""}> <span>${esc(l)}</span></label>`).join("");
+  $("#stages").onchange = (e) => { const k = e.target.dataset.stage; if (!k) return; st[k] = e.target.checked; renderStages(); changed(); };
+  const ts = mskTs(d.meta.deadlineAt);
+  const left = $("#dl-left");
+  left.textContent = ts ? leftText(ts) : "срок не указан";
+  left.className = "pill " + (ts ? urgency(ts) : "neutral");
+}
+async function loadReminders() {
+  if (!T) return;
+  const id = T.id;
+  let r;
+  try { r = await api("GET", `/api/tenders/${id}/reminders`); } catch (e) { return; }
+  if (!T || T.id !== id) return;
+  $("#rem-list").innerHTML = r.reminders.map((x) => `<div class="doc"><span class="name">${x.sent ? "✓ " : "⏰ "}${esc(x.text || "Напоминание")}<br><span class="small muted">${esc(fmtMsk(x.at))}</span></span><button class="icon" type="button" data-rem="${x.id}" aria-label="Удалить напоминание">×</button></div>`).join("")
+    || `<p class="small muted">Напоминаний нет.</p>`;
+  $("#rem-list").onclick = async (e) => {
+    const b = e.target.closest("[data-rem]");
+    if (!b) return;
+    try { await api("DELETE", `/api/tenders/${id}/reminders/${b.dataset.rem}`); loadReminders(); } catch (ex) { toast(ex.message); }
+  };
+  if (!$("#rem-at").value) $("#rem-at").value = tsMsk(Math.floor(Date.now() / 1000) + 86400).slice(0, 11) + "10:00";
+  api("GET", "/api/telegram").then((tg) => {
+    $("#rem-hint").innerHTML = tg.linked ? "Напоминания придут в Telegram. За сутки и за 3 часа до окончания подачи Telegram напомнит сам."
+      : tg.enabled ? 'Чтобы напоминания приходили на телефон, подключите Telegram в <a href="#/settings">Настройках</a>. Или нажмите «В календарь».'
+      : "Напоминания видны на главной странице. Чтобы получать их на телефон, нажмите «В календарь».";
+  }).catch(() => {});
+}
+function noteText() {
+  const d = T.data, r = last, c = r.cur, b = r.b, L = [];
+  L.push(`Тендер: ${d.meta.subject || "без названия"}`);
+  if (d.meta.number) L.push(`№ ${d.meta.number} · ${LAWS[d.meta.law] || ""}`);
+  if (d.meta.customer) L.push(`Заказчик: ${d.meta.customer}`);
+  const ts = mskTs(d.meta.deadlineAt);
+  if (ts) L.push(`Подача до: ${fmtMsk(ts)} (${leftText(ts)})`);
+  if (d.meta.url) L.push(`Ссылка: ${d.meta.url}`);
+  if (b.nmck > 0) L.push(`НМЦК: ${rub(b.nmck)}`);
+  if (r.has) {
+    L.push(`Закупка: ${rub(b.gross)}${d.supplierVat ? " с НДС" : ""}`);
+    L.push(`Продажа (наша цена): ${rub(c.P)}${b.nmck > 0 ? `, снижение ${pct(c.disc)}` : ""}`);
+    if (b.tax.vat > 0) L.push(`НДС к уплате: ${rub(Math.max(0, c.vatPay))}`);
+    L.push(`${b.tax.kind === "profit" ? "Налог на прибыль" : "УСН"}: ${rub(c.incomeTax)}`);
+    L.push(`Чистая прибыль: ${rub(c.net)}, маржа ${pct(c.margin)}`);
+  }
+  L.push(`Следующий шаг: ${nextStage(d)}`);
+  if (d.note) L.push(`Заметка: ${d.note}`);
+  return L.join("\n");
+}
+function exportIcs() {
+  const d = T.data, ts = mskTs(d.meta.deadlineAt);
+  if (!ts) return toast("Сначала укажите окончание подачи");
+  const z = (t) => new Date(t * 1000).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const escI = (s) => String(s).replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/[,;]/g, (m) => "\\" + m);
+  const ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//tender//ru", "BEGIN:VEVENT", `UID:tender-${T.id}-${ts}@tender`, `DTSTAMP:${z(Date.now() / 1000 | 0)}`,
+    `DTSTART:${z(ts - 3600)}`, `DTEND:${z(ts)}`, `SUMMARY:${escI("Окончание подачи: " + (d.meta.subject || "тендер"))}`, `DESCRIPTION:${escI(noteText())}`,
+    d.meta.url ? `URL:${d.meta.url}` : "", "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Завтра окончание подачи", "TRIGGER:-P1D", "END:VALARM",
+    "BEGIN:VALARM", "ACTION:DISPLAY", "DESCRIPTION:Через 3 часа окончание подачи", "TRIGGER:-PT2H", "END:VALARM", "END:VEVENT", "END:VCALENDAR"].filter(Boolean).join("\r\n");
+  downloadFile(`tender-${d.meta.number || T.id}.ics`, ics, "text/calendar");
+}
+
+/* ---------- подводные камни ---------- */
+function renderRisks() {
+  if (!T || !$("#risks")) return;
+  const d = T.data, r = last, f = { ...(d.flags || {}), ...(T.docFlags || {}) }, out = [];
+  const add = (cls, text, quote) => out.push(`<li class="${cls}"><span>${esc(text)}</span>${quote ? `<span class="quote">«…${esc(quote)}…»</span>` : ""}</li>`);
+  if (f.analogs) f.analogs.value === "allowed" ? add("good", "Эквивалент допускается: можно предложить аналог из вашего прайса.", f.analogs.quote) : add("bad", "Эквивалент не допускается: нужен именно указанный товар.", f.analogs.quote);
+  if (f.trademark && !f.analogs) add("warn", "Указаны товарные знаки. Проверьте, допускаются ли аналоги.", f.trademark.quote);
+  if (f.smp) add("warn", "Закупка только для малого бизнеса (СМП/СОНКО): проверьте, что вы есть в реестре МСП.", f.smp.quote);
+  if (f.national) add("warn", "Нацрежим или ограничения для иностранных товаров: понадобятся документы о стране происхождения.", f.national.quote);
+  if (f.samples) add("warn", "Нужны образцы товара.", f.samples.quote);
+  if (f.installation) add("warn", "Есть монтаж или пусконаладка: заложите работы в цену.", f.installation.quote);
+  if (f.unload) add("warn", "Разгрузка силами поставщика: заложите грузчиков.", f.unload.quote);
+  if (f.multiaddr) add("warn", "Поставка партиями или по нескольким адресам: доставка обойдётся дороже.", f.multiaddr.quote);
+  if (f.penalty) add("warn", "В проекте контракта есть штрафы и пени: прочитайте условия.", f.penalty.quote);
+  const ts = mskTs(d.meta.deadlineAt);
+  if (ts && ts - Date.now() / 1000 < 2 * 86400 && ts > Date.now() / 1000) add("bad", "До окончания подачи меньше 2 дней.");
+  if (!(num(d.nmck) > 0)) add("warn", "НМЦ не указана: побеждает, скорее всего, самая низкая цена.");
+  if (num(d.adv.advancePct) === 0 && num(d.adv.paymentDays) > 30) add("warn", "Оплата позже 30 дней без аванса: деньги будут заморожены.");
+  if (num(d.adv.advancePct) >= 100) add("good", "100% предоплата: свои деньги в оборот не нужны.");
+  if (num(d.adv.conSecPct) >= 10) add("warn", `Высокое обеспечение исполнения: ${pct(num(d.adv.conSecPct), 0)}.`);
+  if ((d.missingDocs || []).length) add("warn", "Часть документов скачивается только после входа на площадку.");
+  const mk = T.market;
+  if (mk && mk.customer && mk.customer.count >= 4 && mk.customer.canceled / mk.customer.count >= 0.3) add("bad", `Заказчик часто отменяет закупки: ${mk.customer.canceled} из ${mk.customer.count} последних.`);
+  if (r && r.has && r.be) {
+    const comp = competitorLot(true) || competitorLot(false);
+    if (comp && comp < r.be) add("bad", `Конкуренты продавали дешевле нашей безубыточной цены (${rub(comp)} против ${rub(r.be)}).`);
+  }
+  $("#risks").innerHTML = out.join("") || `<li class="neutral"><span>Особых условий не нашлось. Загрузите закупку по ссылке или документы, чтобы проверить подробнее.</span></li>`;
+}
+
+/* ---------- цены конкурентов (ЕИС) ---------- */
+async function runMarket() {
+  const d = T.data;
+  const items = d.items.filter((x) => (x.name || "").trim() && num(x.qty) > 0);
+  if (!items.length) return toast("Сначала добавьте позиции");
+  try {
+    await api("POST", `/api/tenders/${T.id}/market`, { items, place: d.meta.place, customer: d.meta.customer, inn: d.inn });
+    $("#mk-run").disabled = true;
+    pollMarket();
+  } catch (e) { toast(e.message); }
+}
+function pollMarket() { clearInterval(marketTimer); marketTimer = setInterval(loadMarket, 3000); }
+async function loadMarket() {
+  if (!T) return;
+  const id = T.id;
+  let r;
+  try { r = await api("GET", `/api/tenders/${id}/market`); } catch (e) { return; }
+  if (!T || T.id !== id) return;
+  const job = r.job;
+  $("#mk-job").textContent = job && job.running ? `${job.text || "Ищу"}… (${job.done || 0} из ${job.total || "?"})` : job && job.error ? job.error : "";
+  $("#mk-run").disabled = !!(job && job.running);
+  if (job && job.running) { if (!marketTimer) pollMarket(); } else { clearInterval(marketTimer); marketTimer = 0; }
+  T.market = r.data;
+  renderMarket();
+  recalc();
+}
+function renderMarket() {
+  const mk = T.market, box = $("#mk-out");
+  if (!mk) { box.innerHTML = `<p class="small muted">Нажмите «Найти в ЕИС». Поиск идёт на сервере и займёт 1–3 минуты.</p>`; return; }
+  const st = (s) => (s ? `<b>${rub2(s.median)}</b><br><span class="small muted">${rub2(s.min)} – ${rub2(s.max)} · ${s.n} ${plural(s.n, "контракт", "контракта", "контрактов")}</span>` : `<span class="muted">нет данных</span>`);
+  const suppliers = {};
+  mk.items.forEach((i) => (i.matches || []).forEach((m) => { if (m.supplier) suppliers[m.supplier] = (suppliers[m.supplier] || 0) + 1; }));
+  const top = Object.entries(suppliers).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const when = new Date(mk.at * 1000).toLocaleDateString("ru-RU");
+  let html = `<p class="small muted">Регион тендера: ${esc(mk.region || "не определён")} · обновлено ${when} · цены за единицу из контрактов, обычно с НДС</p>
+    <div class="table-wrap" style="margin-top:8px"><table style="min-width:640px"><thead><tr><th>Позиция</th><th class="r">В регионе</th><th class="r">По России</th><th>Найти вручную</th></tr></thead><tbody>
+    ${mk.items.map((i) => `<tr><td>${esc(i.name)}<div class="small muted">поиск: «${esc(i.query)}»${i.error ? ` · <span class="err">${esc(i.error)}</span>` : ""}</div></td><td class="r">${st(i.region)}</td><td class="r">${st(i.rf)}</td>
+      <td class="small"><a href="${esc(i.searchUrl)}" target="_blank" rel="noopener">ЕИС</a> · <a href="https://yandex.ru/search/?text=${encodeURIComponent(i.query + " цена купить оптом " + (mk.region || ""))}" target="_blank" rel="noopener">Яндекс</a></td></tr>`).join("")}
+    </tbody></table></div>`;
+  if (top.length) html += `<h3 style="margin-top:14px">Кто поставлял</h3><p class="small">${top.map(([n, c]) => `${esc(n)} (${c})`).join(" · ")}</p>`;
+  const all = mk.items.flatMap((i) => (i.matches || []).map((m) => ({ ...m, item: i.name }))).sort((a, b) => (a.regionKey === mk.regionKey ? -1 : 0) - (b.regionKey === mk.regionKey ? -1 : 0)).slice(0, 15);
+  if (all.length) html += `<details><summary>Контракты (${all.length})</summary><div class="docs-list">${all.map((m) => `<a class="doc" href="${esc(m.url)}" target="_blank" rel="noopener"><span class="name">${esc(m.name)}<br><span class="small muted">${esc([m.region, m.date, m.supplier].filter(Boolean).join(" · "))}</span></span><span class="num">${rub2(m.price)}/${esc(m.unit || "ед.")}</span></a>`).join("")}</div></details>`;
+  const cu = mk.customer;
+  if (cu) html += `<h3 style="margin-top:14px">Заказчик: последние закупки</h3><p class="small">Найдено ${cu.count}, отменено ${cu.canceled}. <a href="${esc(cu.url)}" target="_blank" rel="noopener">Все в ЕИС</a></p>
+    <div class="docs-list">${cu.purchases.slice(0, 6).map((p) => `<a class="doc" href="${esc(p.url)}" target="_blank" rel="noopener"><span class="name">${esc(p.subject || p.number)}<br><span class="small muted">${esc([p.date, p.status].filter(Boolean).join(" · "))}</span></span><span class="num">${p.nmck ? rub(p.nmck) : ""}</span></a>`).join("")}</div>`;
+  if (!mk.items.some((i) => i.rf)) html += `<p class="note" style="margin-top:10px">Похожих контрактов с ценой за единицу не нашлось. Попробуйте упростить названия позиций (например, «Щебень 5-20» вместо полного описания) и поискать снова, или откройте поиск в ЕИС и Яндексе по ссылкам.</p>`;
+  box.innerHTML = html;
 }
 
 /* ---------- прайс ---------- */
@@ -844,6 +1222,26 @@ async function viewPrices() {
 }
 
 /* ---------- настройки ---------- */
+async function renderTg() {
+  const box = $("#tg-card");
+  let tg;
+  try { tg = await api("GET", "/api/telegram"); } catch (e) { box.hidden = true; return; }
+  if (!tg.enabled) { box.innerHTML = `<div class="card-h"><h2>Напоминания в Telegram</h2></div><p class="muted small">Telegram-бот на сервере не подключён. Напоминания видны на главной странице, а срок можно добавить в календарь телефона кнопкой «В календарь» в тендере.</p>`; return; }
+  box.innerHTML = `<div class="card-h"><h2>Напоминания в Telegram</h2></div>
+    ${tg.linked ? `<p>Telegram подключён. Сюда придут ваши напоминания, а за сутки и за 3 часа до окончания подачи придёт напоминание о сроке.</p>
+      <div class="row" style="margin-top:10px"><button class="btn sm" type="button" id="tg-test">Проверить</button><button class="btn sm danger" type="button" id="tg-off">Отключить</button></div>`
+    : `<p>Подключите Telegram, и напоминания о сроках будут приходить на телефон.</p><div class="row" style="margin-top:10px"><button class="btn primary" type="button" id="tg-on">Подключить Telegram</button></div><p class="hint" id="tg-hint" style="margin-top:6px"></p>`}`;
+  const on = $("#tg-on"), test = $("#tg-test"), off = $("#tg-off");
+  if (on) on.onclick = async () => {
+    try {
+      const r = await api("POST", "/api/telegram/link", {});
+      $("#tg-hint").innerHTML = `Откроется Telegram, нажмите там «Запустить» (Start). Если не открылся: <a href="${esc(r.url)}" target="_blank" rel="noopener">открыть бота</a>. Потом обновите эту страницу.`;
+      window.open(r.url, "_blank", "noopener");
+    } catch (ex) { toast(ex.message); }
+  };
+  if (test) test.onclick = async () => { try { await api("POST", "/api/telegram/test", {}); toast("Сообщение отправлено в Telegram"); } catch (ex) { toast(ex.message); } };
+  if (off) off.onclick = async () => { try { await api("DELETE", "/api/telegram/link"); renderTg(); } catch (ex) { toast(ex.message); } };
+}
 function viewSettings() {
   const s = SETTINGS;
   app.innerHTML = `
@@ -858,10 +1256,12 @@ function viewSettings() {
         <div class="field"><label for="s-target">Целевая маржа</label><div class="inp"><input id="s-target" class="n" inputmode="decimal" value="${fmtIn(s.targetPct, true)}"><span class="u">%</span></div></div>
         <div class="field"><label for="s-money">Стоимость денег</label><div class="inp"><input id="s-money" class="n" inputmode="decimal" value="${fmtIn(s.moneyRatePct, true)}"><span class="u">% год.</span></div></div>
         <div class="field"><label for="s-bg">Банковская гарантия</label><div class="inp"><input id="s-bg" class="n" inputmode="decimal" value="${fmtIn(s.bgRatePct, true)}"><span class="u">% год.</span></div></div>
+        <div class="field"><label for="s-minm">Минимальная маржа</label><div class="inp"><input id="s-minm" class="n" inputmode="decimal" value="${fmtIn(s.minMarginPct ?? 3, true)}"><span class="u">%</span></div><span class="hint">Ниже неё рекомендуемая цена не опустится</span></div>
       </div>
       <label class="check" style="margin-top:12px"><input type="checkbox" id="s-svat"${s.supplierVat ? " checked" : ""}> <span>Цены поставщиков обычно с НДС 22%</span></label>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="s-save" type="button">Сохранить</button></div>
     </div>
+    <div class="card" id="tg-card"></div>
     <div class="card">
       <div class="card-h"><h2>Личная ссылка</h2></div>
       <p>Откройте её на телефоне или другом компьютере, и там будут ваши тендеры и прайс. Никому её не пересылайте: по ней открываются ваши данные.</p>
@@ -887,7 +1287,7 @@ function viewSettings() {
         settings: {
           tax: { regime: $("#s-regime").value, usnVat: num($("#s-usnvat").value), usnRate: num($("#s-usnrate").value) },
           overheadPct: num($("#s-over").value), targetPct: num($("#s-target").value), moneyRatePct: num($("#s-money").value), bgRatePct: num($("#s-bg").value),
-          supplierVat: $("#s-svat").checked,
+          supplierVat: $("#s-svat").checked, minMarginPct: num($("#s-minm").value),
         },
       });
       ME = r.user; SETTINGS = r.settings;
@@ -896,6 +1296,7 @@ function viewSettings() {
     } catch (ex) { toast(ex.message); }
   };
   $("#k-copy").onclick = () => copyText(personalLink(), $("#k-link"));
+  renderTg();
   $("#k-new").onclick = (e) => confirmInline(e.currentTarget, "Сменить ссылку?", async () => {
     const r = await api("POST", "/api/relink", {});
     KEY = r.key; viewSettings(); toast("Новая ссылка готова. Сохраните её");
@@ -906,4 +1307,6 @@ function viewSettings() {
   });
 }
 
+app.addEventListener("input", onField);
+app.addEventListener("change", onField);
 boot().catch(() => showStart(""));

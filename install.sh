@@ -86,6 +86,19 @@ else
   DOMAIN="$(grep -E '^TENDER_DOMAIN=' "$ENV_FILE" | cut -d= -f2- || true)"
 fi
 grep -q '^TENDER_INVITE=.\+' "$ENV_FILE" || set_env TENDER_INVITE "$(python3 -c 'import secrets; print(secrets.token_urlsafe(9))')"
+if ! grep -q '^TENDER_TG_TOKEN=' "$ENV_FILE"; then
+  echo
+  echo "Напоминания в Telegram (необязательно, бесплатно):"
+  echo "  1) в Telegram откройте @BotFather, отправьте /newbot и придумайте имя бота;"
+  echo "  2) BotFather пришлёт токен вида 123456789:AA... Вставьте его ниже."
+  echo "Чтобы пропустить, нажмите Enter (подключить можно позже: запустите установку ещё раз)."
+  TG="$(ask 'Токен бота: ' | tr -d '[:space:]')"
+  if [ -n "$TG" ] && ! printf '%s' "$TG" | grep -Eq '^[0-9]{5,15}:[A-Za-z0-9_-]{20,}$'; then
+    echo "Токен не похож на настоящий, пропускаю. Запустите установку ещё раз, чтобы попробовать снова."
+    TG=""
+  fi
+  [ -n "$TG" ] && set_env TENDER_TG_TOKEN "$TG"
+fi
 chown root:tender "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 
@@ -186,6 +199,7 @@ else
   PUBLIC="http://${IP}:${PORT_PUBLIC}"
 fi
 set_env TENDER_PUBLIC_URL "$PUBLIC"
+systemctl restart "$SVC"
 
 cat > /usr/local/bin/tender-link <<'LINK'
 #!/bin/sh
@@ -230,6 +244,7 @@ echo
 if [ -z "$DOMAIN" ]; then
   echo "Если ссылка не открывается, разрешите входящий порт ${PORT_PUBLIC} в панели Рег.облака."
 fi
+if grep -q '^TENDER_TG_TOKEN=.\+' "$ENV_FILE"; then echo "Telegram-бот подключён: каждый включает напоминания в разделе «Настройки»."; fi
 echo "Показать ссылку ещё раз:           tender-link"
 echo "Выпустить новую (старая отключится): tender-link new"
 echo "Обновить программу: запустите команду установки ещё раз."

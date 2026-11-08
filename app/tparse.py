@@ -493,11 +493,14 @@ def extract(pages, url):
     for purl, text in pages[:1]:
         h1 = norm(parse_html(text).h1)
     subject = find_value(lines, FIELDS["subject"], IS_TEXT) or h1 or (max(title.split(" - "), key=len) if title else "")
+    customer = norm(find_value(lines, FIELDS["customer"], IS_TEXT) or "")[:300]
     return {
+        "flags": flags(full),
+        "inn": find_inn(customer, full[:20000]),
         "number": detect_number(url, lines),
         "law": detect_law(url, full),
         "subject": norm(subject)[:300],
-        "customer": norm(find_value(lines, FIELDS["customer"], IS_TEXT) or "")[:300],
+        "customer": customer,
         "deadline": norm(find_value(lines, FIELDS["deadline"], HAS_DATE) or "")[:80],
         "place": norm(find_value(lines, FIELDS["place"], IS_TEXT) or "")[:300],
         "contractTerm": norm(find_value(lines, FIELDS["contractTerm"], HAS_NUM) or "")[:200],
@@ -518,3 +521,183 @@ def extra_pages(url):
     if u.hostname and u.hostname.endswith("zakupki.gov.ru") and "common-info" in u.path:
         return [urllib.parse.urlunsplit(u._replace(path=u.path.replace("common-info", "documents")))]
     return []
+
+
+# ---------------------------------------------------------------- условия закупки (флаги и подводные камни)
+
+def _snip(text, m, width=90):
+    a = max(0, m.start() - width)
+    b = min(len(text), m.end() + width)
+    return norm(text[a:b])
+
+
+FLAG_RULES = [
+    # (ключ, regex, значение)
+    ("analogs", r"эквивалент\w*\s+не\s+(допуска|предусмотр)|без\s+(возможности\s+)?(поставки\s+)?эквивалент|не\s+допускается\s+(поставка\s+)?эквивалент", "forbidden"),
+    ("analogs", r"или\s+эквивалент|допуска\w*\s+(поставка\s+)?эквивалент|эквивалент\w*\s+допуска|возможн\w+\s+поставк\w+\s+эквивалент", "allowed"),
+    ("smp", r"только\s+(для\s+)?субъект\w+\s+мал|участник\w*\s+(закупки\s+)?могут\s+быть\s+только\s+субъект\w+\s+мал|субъект\w+\s+малого\s+и\s+среднего\s+предпринимательства|\bсмп\b|\bсонко\b", True),
+    ("national", r"национальн\w+\s+режим|запрет\w*\s+(на\s+)?допуск|ограничени\w+\s+допуска|услови\w+\s+допуска|постановлени\w+\s+правительства\s+рф\s+№\s*1875|пп\s*рф\s*№?\s*1875|приказ\w*\s+минфина\s+№?\s*126н", True),
+    ("trademark", r"товарн\w+\s+знак", True),
+    ("samples", r"предостав\w+\s+образц|образцы\s+товара", True),
+    ("installation", r"монтаж|пусконаладк|шеф-?монтаж|установк\w+\s+оборудован", True),
+    ("unload", r"разгрузк\w+\s+(силами|за\s+сч[её]т)\s+поставщик|погрузочно-?разгрузочн", True),
+    ("multiaddr", r"(по\s+(следующим\s+)?адресам|адреса\s+поставки|согласно\s+графику\s+поставк|партиями|по\s+заявкам\s+заказчика)", True),
+    ("penalty", r"(штраф|пен[ия])\w*\s+в\s+размере", True),
+]
+
+
+def flags(text):
+    t = text.lower()
+    out = {}
+    for key, rx, val in FLAG_RULES:
+        if key in out:
+            continue
+        m = re.search(rx, t)
+        if m:
+            out[key] = {"value": val, "quote": _snip(text, m)}
+    return out
+
+
+INN_RE = re.compile(r"ИНН[\s:№]*?(\d{10}|\d{12})\b")
+
+
+def find_inn(*texts):
+    for s in texts:
+        m = INN_RE.search(s or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+# ---------------------------------------------------------------- регионы, единицы, сравнение позиций
+
+REGION_RX = re.compile(
+    r"(москв\w*|санкт-петербург\w*|севастопол\w*|"
+    r"республик\w+\s+[А-ЯЁа-яё-]+|[А-ЯЁа-яё-]+\s+республик\w+|"
+    r"[А-ЯЁа-яё-]+(?:ская|цкая|ской|цкой)\s+(?:обл\w*|авт\w*\s+обл\w*)|"
+    r"[А-ЯЁа-яё-]+(?:ский|цкий|ского|цкого)\s+(?:край|края|автономн\w+\s+округ\w*|ао)|"
+    r"[А-ЯЁа-яё-]+\s+(?:край|края))",
+    re.I,
+)
+
+
+def region_of(*texts):
+    """Короткий «ключ» региона для сравнения: первые 6 букв названия, в нижнем регистре."""
+    for s in texts:
+        m = REGION_RX.search(s or "")
+        if m:
+            words = re.findall(r"[а-яё-]+", m.group(1).lower())
+            words = [w for w in words if not re.fullmatch(r"(республик\w*|обл\w*|край|края|автономн\w*|авт|округ\w*|ао)", w)]
+            if words:
+                return words[0][:6], norm(m.group(1))
+    return "", ""
+
+
+UNIT_MAP = [
+    (r"^(т|тн|тонн\w*|тонна)$", "т"),
+    (r"^(кг|килограм\w*)$", "кг"),
+    (r"^(г|грамм\w*)$", "г"),
+    (r"^(л|литр\w*|дм3)$", "л"),
+    (r"^(м3|м\^3|куб\.?\s*м\.?|кубическ\w*\s+метр\w*)$", "м3"),
+    (r"^(м2|м\^2|кв\.?\s*м\.?|квадратн\w*\s+метр\w*)$", "м2"),
+    (r"^(м|пог\.?\s*м\.?|п\.?\s*м\.?|метр\w*|погонн\w*\s+метр\w*)$", "м"),
+    (r"^(шт|штук\w*|штука|ед|единиц\w*)$", "шт"),
+    (r"^(упак\w*|уп)$", "упак"),
+    (r"^(компл\w*|кмп)$", "компл"),
+    (r"^(рулон\w*|рул)$", "рулон"),
+    (r"^(меш\w*)$", "мешок"),
+    (r"^(бочк\w*|боч)$", "бочка"),
+    (r"^(усл\w*\s*ед\w*|услуг\w*)$", "усл"),
+]
+
+
+def unit_key(u):
+    s = norm(u).lower().strip(" .")
+    s = s.replace("²", "2").replace("³", "3")
+    for rx, key in UNIT_MAP:
+        if re.match(rx, s):
+            return key
+    return s
+
+
+STOP = set("""для из на по под при без или и в с со к от до а также шт кг т м л гост ту марка тип вид товар поставка
+поставки продукции материал материалы изделие изделия код позиции наименование объекта закупки
+количестве количество объеме объем бочки бочка бочек канистра ведро мешок упаковка ед""".split())
+
+
+def tokens(s):
+    s = (s or "").lower().replace("ё", "е")
+    raw = re.findall(r"[a-zа-я]+|\d+(?:[.,]\d+)?(?:-\d+(?:[.,]\d+)?)?", s)
+    out = []
+    for w in raw:
+        if w in STOP or (len(w) < 3 and not w[0].isdigit()):
+            continue
+        out.append(w[:7] if w[0].isalpha() else w)
+    return out
+
+
+def similarity(a, b):
+    """Насколько позиция b похожа на позицию a (0..1): доля значимых слов a, найденных в b."""
+    base = re.split(r"[(,;]", a or "", maxsplit=1)[0]
+    ta = tokens(base) or tokens(a)
+    ta += [w for w in tokens(a) if w[0].isdigit()]  # размеры и фракции из описания тоже важны
+    tb = set(tokens(b))
+    if not ta:
+        return 0.0
+    ta = list(dict.fromkeys(ta))[:8]
+    hit = sum(1 for w in ta if w in tb)
+    # первое слово обычно главное («Щебень», «Цемент», «Масло»)
+    if ta[0] not in tb:
+        return hit / len(ta) * 0.5
+    return hit / len(ta)
+
+
+def search_query(name, limit=3):
+    """2–3 значимых слова для поиска похожих закупок: сначала из названия до скобок."""
+    base = re.split(r"[(,;]", name or "", maxsplit=1)[0]
+    out, seen = [], set()
+    for part in ((base,) if re.search(r"[А-Яа-яЁёA-Za-z]{3}", base) else (name or "",)):
+        for w in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9-]*", part):
+            k = w.lower()
+            if k in STOP or len(w) < 3 or k in seen:
+                continue
+            seen.add(k)
+            out.append(w)
+            if len(out) >= limit:
+                return " ".join(out)
+    return " ".join(out)
+
+
+# ---------------------------------------------------------------- текст из документов (без внешних библиотек)
+
+def doc_text(name, data, limit=400000):
+    """Текст из DOCX, XLSX, ODT, RTF, TXT. Для PDF и сканов возвращает пустую строку."""
+    import io
+    import zipfile
+    ext = (name.rsplit(".", 1)[-1] if "." in name else "").lower()
+    try:
+        if ext in ("docx", "xlsx", "odt", "ods", "zip"):
+            out = []
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for n in z.namelist():
+                    if re.search(r"(word/document|word/header\d*|word/footer\d*|xl/sharedStrings|xl/worksheets/sheet\d+|content)\.xml$", n):
+                        xml = z.read(n)[:5_000_000].decode("utf-8", "ignore")
+                        xml = re.sub(r"</w:p>|</row>|<text:p[^>]*>", "\n", xml)
+                        out.append(html.unescape(re.sub(r"<[^>]+>", " ", xml)))
+                    elif ext == "zip" and re.search(r"\.(docx|xlsx|txt|rtf)$", n, re.I) and len(out) < 20:
+                        out.append(doc_text(n, z.read(n)[:20_000_000], limit))
+            return re.sub(r"[ \t]+", " ", "\n".join(out))[:limit]
+        if ext == "rtf":
+            t = data.decode("latin-1")
+            t = re.sub(r"\\'([0-9a-f]{2})", lambda m: bytes([int(m.group(1), 16)]).decode("cp1251", "ignore"), t)
+            t = re.sub(r"\\[a-z]+-?\d* ?|[{}]", " ", t)
+            return re.sub(r"\s+", " ", t)[:limit]
+        if ext in ("txt", "csv"):
+            for enc in ("utf-8", "cp1251"):
+                try:
+                    return data.decode(enc)[:limit]
+                except UnicodeDecodeError:
+                    continue
+    except Exception:
+        return ""
+    return ""

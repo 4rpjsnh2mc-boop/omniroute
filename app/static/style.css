@@ -158,3 +158,16 @@ td.num, td.r { font-family: var(--mono); font-variant-numeric: tabular-nums; whi
 .saved { font-size: 13px; color: var(--ink-3); }
 @media (max-width: 700px) { .top { position: static; } .summary { top: 12px; } }
 @media (max-width: 560px) { .big { font-size: 24px; } .card { padding: 14px; } .nav a { padding: 5px 8px; } }
+
+.stages { display: flex; flex-wrap: wrap; gap: 8px; }
+.stage { border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px 5px 8px; background: var(--surface); cursor: pointer; }
+.stage.done { background: var(--good-soft); border-color: transparent; color: var(--good); text-decoration: line-through; }
+.risks { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.risks li { display: grid; gap: 2px; padding: 8px 10px 8px 12px; border-radius: 8px; border-left: 4px solid var(--line); background: var(--surface-2); }
+.risks li.bad { border-left-color: var(--bad); } .risks li.warn { border-left-color: var(--warn); } .risks li.good { border-left-color: var(--good); }
+.risks .quote { font-size: 12px; color: var(--ink-3); }
+.rec { border: 1px solid #f3833d; border-radius: 10px; padding: 10px 12px; background: rgba(243, 131, 61, .08); }
+.rec-v { font-size: 22px; font-weight: 700; font-family: var(--mono); color: #f3833d; }
+a.doc { text-decoration: none; color: var(--ink); }
+a.doc:hover { border-color: var(--accent); }
+.err { color: var(--bad); }

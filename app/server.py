@@ -31,6 +31,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import market
 import tparse as tparser
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +41,8 @@ HOST = os.environ.get("TENDER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TENDER_PORT", "8090"))
 DB_PATH = os.path.join(DATA, "app.db")
 INVITE = os.environ.get("TENDER_INVITE", "").strip()
+TG_TOKEN = os.environ.get("TENDER_TG_TOKEN", "").strip()
+PUBLIC_URL = os.environ.get("TENDER_PUBLIC_URL", "").strip().rstrip("/")
 FILES = os.path.join(DATA, "files")
 COOKIE_DAYS = 400
 COOKIE = "tsid"
@@ -57,6 +60,7 @@ DEFAULT_SETTINGS = {
     "targetPct": 10,
     "moneyRatePct": 18,
     "bgRatePct": 3,
+    "minMarginPct": 3,
 }
 
 # ---------------------------------------------------------------- база
@@ -96,8 +100,25 @@ def db():
               name TEXT NOT NULL, unit TEXT NOT NULL DEFAULT '', cost REAL NOT NULL DEFAULT 0,
               note TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS prices_user ON prices(user_id, name COLLATE NOCASE);
+            CREATE TABLE IF NOT EXISTS reminders (
+              id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+              at INTEGER NOT NULL, text TEXT NOT NULL DEFAULT '', sent INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS reminders_due ON reminders(sent, at);
+            CREATE TABLE IF NOT EXISTS notified (tender_id INTEGER NOT NULL REFERENCES tenders(id) ON DELETE CASCADE,
+              kind TEXT NOT NULL, PRIMARY KEY (tender_id, kind));
+            CREATE TABLE IF NOT EXISTS market (tender_id INTEGER PRIMARY KEY REFERENCES tenders(id) ON DELETE CASCADE,
+              data TEXT NOT NULL, updated INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS docflags (tender_id INTEGER PRIMARY KEY REFERENCES tenders(id) ON DELETE CASCADE,
+              data TEXT NOT NULL);
             """
         )
+        for table, col, decl in (("users", "tg_chat", "INTEGER"), ("users", "tg_code", "TEXT"),
+                                 ("tenders", "deadline_ts", "INTEGER"), ("tenders", "stage", "TEXT NOT NULL DEFAULT ''"),
+                                 ("tenders", "important", "INTEGER NOT NULL DEFAULT 0"), ("tenders", "cost", "REAL")):
+            cols = [r[1] for r in _db.execute(f"PRAGMA table_info({table})")]
+            if col not in cols:
+                _db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         _db.commit()
     return _db
 
@@ -285,6 +306,23 @@ def doc_dir(tender_id):
     return d
 
 
+def update_docflags(tender_id):
+    """Ищем в документах тендера «или эквивалент», СМП, нацрежим и т.п."""
+    found = {}
+    for d in q("SELECT name, path FROM docs WHERE tender_id=? AND status='ok'", (tender_id,)):
+        try:
+            with open(os.path.join(FILES, str(int(tender_id)), d["path"]), "rb") as f:
+                text = tparser.doc_text(d["name"], f.read(MAX_DOC))
+        except OSError:
+            continue
+        for k, v in tparser.flags(text).items():
+            if k not in found or (k == "analogs" and v["value"] == "forbidden"):
+                v["doc"] = d["name"]
+                found[k] = v
+    ex("INSERT INTO docflags(tender_id, data) VALUES (?,?) ON CONFLICT(tender_id) DO UPDATE SET data=excluded.data",
+       (tender_id, json.dumps(found, ensure_ascii=False)))
+
+
 def store_doc(tender_id, name, data, src_url=""):
     ext = os.path.splitext(name)[1].lower()[:10]
     fname = secrets.token_hex(8) + re.sub(r"[^.a-z0-9]", "", ext)
@@ -323,8 +361,11 @@ def download_docs(tender_id, docs):
             with _jobs_lock:
                 _jobs[tender_id]["done"] += 1
     finally:
-        with _jobs_lock:
-            _jobs[tender_id]["running"] = False
+        try:
+            update_docflags(tender_id)
+        finally:
+            with _jobs_lock:
+                _jobs[tender_id]["running"] = False
 
 
 # ---------------------------------------------------------------- HTTP
@@ -572,7 +613,7 @@ def api_profile(h, user):
             v = num_or_none(tax.get(k))
             if v is not None and 0 <= v <= 50:
                 s["tax"][k] = v
-        for k in ("overheadPct", "targetPct", "moneyRatePct", "bgRatePct"):
+        for k in ("overheadPct", "targetPct", "moneyRatePct", "bgRatePct", "minMarginPct"):
             v = num_or_none(st.get(k))
             if v is not None and 0 <= v <= 100:
                 s[k] = v
@@ -585,7 +626,8 @@ def api_profile(h, user):
 
 # ---------------------------------------------------------------- API: тендеры
 
-SUMMARY = ("title", "number", "url", "customer", "status", "nmck", "price", "profit", "margin", "deadline")
+SUMMARY = ("title", "number", "url", "customer", "status", "nmck", "price", "profit", "margin", "deadline",
+           "deadline_ts", "stage", "important", "cost")
 STATUSES = {"draft", "submitted", "won", "lost", "skipped"}
 
 
@@ -638,12 +680,17 @@ def api_tender_put(h, user, tid):
         raise ApiError(413, "Слишком большой тендер")
     s = b.get("summary") if isinstance(b.get("summary"), dict) else {}
     status = s.get("status") if s.get("status") in STATUSES else "draft"
+    dts = num_or_none(s.get("deadlineTs"))
+    old = q("SELECT deadline_ts FROM tenders WHERE id=?", (int(tid),), one=True)
+    if old and (old["deadline_ts"] or None) != (int(dts) if dts else None):
+        ex("DELETE FROM notified WHERE tender_id=?", (int(tid),))  # срок сменился: напомним заново
     ex(f"""UPDATE tenders SET data=?, title=?, number=?, url=?, customer=?, status=?, nmck=?, price=?, profit=?, margin=?,
-           deadline=?, updated=? WHERE id=? AND user_id=?""",
+           deadline=?, deadline_ts=?, stage=?, important=?, cost=?, updated=? WHERE id=? AND user_id=?""",
        (raw, str(s.get("title") or "")[:300], str(s.get("number") or "")[:100], str(s.get("url") or "")[:1000],
         str(s.get("customer") or "")[:300], status, num_or_none(s.get("nmck")), num_or_none(s.get("price")),
-        num_or_none(s.get("profit")), num_or_none(s.get("margin")), str(s.get("deadline") or "")[:80], now(),
-        int(tid), user["id"]))
+        num_or_none(s.get("profit")), num_or_none(s.get("margin")), str(s.get("deadline") or "")[:80],
+        int(dts) if dts else None, str(s.get("stage") or "")[:40], 1 if s.get("important") else 0,
+        num_or_none(s.get("cost")), now(), int(tid), user["id"]))
     h.send_json({"ok": True, "updated": now()})
 
 
@@ -692,7 +739,8 @@ def api_docs(h, user, tid):
     rows = q("SELECT id, name, size, src_url, status, error, created FROM docs WHERE tender_id=? ORDER BY id", (int(tid),))
     with _jobs_lock:
         job = dict(_jobs.get(int(tid), {})) or None
-    h.send_json({"docs": rows, "job": job})
+    fl = q("SELECT data FROM docflags WHERE tender_id=?", (int(tid),), one=True)
+    h.send_json({"docs": rows, "job": job, "flags": json.loads(fl["data"]) if fl else {}})
 
 
 @route("POST", r"/api/tenders/(\d+)/docs")
@@ -705,6 +753,7 @@ def api_doc_upload(h, user, tid):
     if q("SELECT COUNT(*) AS n FROM docs WHERE tender_id=?", (int(tid),), one=True)["n"] >= MAX_DOCS_PER_TENDER:
         raise ApiError(400, "В тендере уже слишком много документов")
     did = store_doc(int(tid), name, data)
+    update_docflags(int(tid))
     h.send_json({"id": did})
 
 
@@ -738,6 +787,123 @@ def api_doc_delete(h, user, tid, did):
 
 
 # ---------------------------------------------------------------- API: прайс (общий для компании)
+
+# ---------------------------------------------------------------- API: цены конкурентов (ЕИС)
+
+_market_jobs = {}
+
+
+def run_market(tid, payload):
+    def progress(done, total, text):
+        with _jobs_lock:
+            _market_jobs[tid] = {"running": True, "done": done, "total": total, "text": text}
+    try:
+        data = market.analyze(payload, lambda u: fetch(u, timeout=40), decode_html, progress)
+        ex("INSERT INTO market(tender_id, data, updated) VALUES (?,?,?) ON CONFLICT(tender_id) DO UPDATE SET data=excluded.data, updated=excluded.updated",
+           (tid, json.dumps(data, ensure_ascii=False), now()))
+        with _jobs_lock:
+            _market_jobs[tid] = {"running": False, "text": "Готово"}
+    except Exception as e:  # сообщаем пользователю коротко, без внутренностей
+        sys.stderr.write(f"market {tid}: {e!r}\n")
+        with _jobs_lock:
+            _market_jobs[tid] = {"running": False, "error": str(e) if isinstance(e, FetchError) else "Поиск не удался. Попробуйте позже"}
+
+
+@route("POST", r"/api/tenders/(\d+)/market")
+def api_market_start(h, user, tid):
+    own_tender(user, tid)
+    tid = int(tid)
+    b = h.json_body()
+    items = [{"id": str(i.get("id") or ""), "name": str(i.get("name") or "")[:300], "unit": str(i.get("unit") or "")[:30],
+              "qty": num_or_none(i.get("qty")) or 0, "nmckUnit": num_or_none(i.get("nmckUnit")) or 0, "cost": num_or_none(i.get("cost")) or 0}
+             for i in (b.get("items") or [])[:100] if isinstance(i, dict)]
+    payload = {"items": items, "place": str(b.get("place") or "")[:300], "customer": str(b.get("customer") or "")[:300],
+               "inn": re.sub(r"\D", "", str(b.get("inn") or ""))[:12]}
+    with _jobs_lock:
+        if _market_jobs.get(tid, {}).get("running"):
+            raise ApiError(409, "Поиск уже идёт")
+        if sum(1 for j in _market_jobs.values() if j.get("running")) >= 3:
+            raise ApiError(429, "Сервер занят другими поисками. Попробуйте через минуту")
+        _market_jobs[tid] = {"running": True, "done": 0, "total": 1, "text": "Начинаю"}
+    threading.Thread(target=run_market, args=(tid, payload), daemon=True).start()
+    h.send_json({"ok": True})
+
+
+@route("GET", r"/api/tenders/(\d+)/market")
+def api_market_get(h, user, tid):
+    own_tender(user, tid)
+    row = q("SELECT data, updated FROM market WHERE tender_id=?", (int(tid),), one=True)
+    with _jobs_lock:
+        job = dict(_market_jobs.get(int(tid), {})) or None
+    h.send_json({"job": job, "data": json.loads(row["data"]) if row else None})
+
+
+# ---------------------------------------------------------------- API: напоминания
+
+@route("GET", r"/api/reminders")
+def api_reminders_all(h, user):
+    rows = q("""SELECT r.id, r.tender_id, r.at, r.text, r.sent, t.title FROM reminders r JOIN tenders t ON t.id=r.tender_id
+                WHERE r.user_id=? AND r.at > ? ORDER BY r.at LIMIT 100""", (user["id"], now() - 7 * 86400))
+    h.send_json({"reminders": rows})
+
+
+@route("GET", r"/api/tenders/(\d+)/reminders")
+def api_reminders(h, user, tid):
+    own_tender(user, tid)
+    h.send_json({"reminders": q("SELECT id, at, text, sent FROM reminders WHERE tender_id=? ORDER BY at", (int(tid),))})
+
+
+@route("POST", r"/api/tenders/(\d+)/reminders")
+def api_reminder_add(h, user, tid):
+    own_tender(user, tid)
+    b = h.json_body()
+    at = num_or_none(b.get("at"))
+    if not at or at < now() - 60 or at > now() + 400 * 86400:
+        raise ApiError(400, "Укажите дату и время в будущем")
+    if q("SELECT COUNT(*) AS n FROM reminders WHERE tender_id=?", (int(tid),), one=True)["n"] >= 30:
+        raise ApiError(400, "Слишком много напоминаний для одного тендера")
+    rid = ex("INSERT INTO reminders(user_id, tender_id, at, text, created) VALUES (?,?,?,?,?)",
+             (user["id"], int(tid), int(at), str(b.get("text") or "")[:300], now()))
+    h.send_json({"id": rid})
+
+
+@route("DELETE", r"/api/tenders/(\d+)/reminders/(\d+)")
+def api_reminder_delete(h, user, tid, rid):
+    own_tender(user, tid)
+    ex("DELETE FROM reminders WHERE id=? AND tender_id=?", (int(rid), int(tid)))
+    h.send_json({"ok": True})
+
+
+# ---------------------------------------------------------------- API: Telegram
+
+@route("GET", r"/api/telegram")
+def api_tg(h, user):
+    h.send_json({"enabled": bool(TG_TOKEN and TG["username"]), "linked": bool(user.get("tg_chat"))})
+
+
+@route("POST", r"/api/telegram/link")
+def api_tg_link(h, user):
+    if not (TG_TOKEN and TG["username"]):
+        raise ApiError(400, "Telegram-бот не подключён на сервере")
+    code = secrets.token_urlsafe(12).replace("-", "a").replace("_", "b")
+    ex("UPDATE users SET tg_code=? WHERE id=?", (code, user["id"]))
+    h.send_json({"url": f"https://t.me/{TG['username']}?start={code}"})
+
+
+@route("DELETE", r"/api/telegram/link")
+def api_tg_unlink(h, user):
+    ex("UPDATE users SET tg_chat=NULL, tg_code=NULL WHERE id=?", (user["id"],))
+    h.send_json({"ok": True})
+
+
+@route("POST", r"/api/telegram/test")
+def api_tg_test(h, user):
+    if not user.get("tg_chat"):
+        raise ApiError(400, "Сначала подключите Telegram")
+    if not tg_send(user["tg_chat"], "Проверка: напоминания тендерного калькулятора будут приходить сюда."):
+        raise ApiError(502, "Telegram не ответил. Попробуйте позже")
+    h.send_json({"ok": True})
+
 
 @route("GET", r"/api/prices")
 def api_prices(h, user):
@@ -792,6 +958,104 @@ def api_price_delete(h, user, pid):
 
 # ---------------------------------------------------------------- запуск
 
+# ---------------------------------------------------------------- Telegram и напоминания
+
+TG = {"username": ""}
+
+
+def tg_call(method, params, timeout=20):
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/{method}",
+                                 data=json.dumps(params).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def tg_send(chat_id, text):
+    try:
+        return tg_call("sendMessage", {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}).get("ok", False)
+    except Exception as e:
+        sys.stderr.write(f"telegram send: {e!r}\n")
+        return False
+
+
+def tg_poll():
+    offset = 0
+    while True:
+        try:
+            if not TG["username"]:
+                TG["username"] = tg_call("getMe", {})["result"]["username"]
+            res = tg_call("getUpdates", {"offset": offset, "timeout": 50, "allowed_updates": ["message"]}, timeout=70)
+            for u in res.get("result", []):
+                offset = u["update_id"] + 1
+                msg = u.get("message") or {}
+                text = (msg.get("text") or "").strip()
+                chat = (msg.get("chat") or {}).get("id")
+                m = re.match(r"^/start\s+([A-Za-z0-9]{8,40})$", text)
+                if m and chat:
+                    user = q("SELECT id, name FROM users WHERE tg_code=?", (m.group(1),), one=True)
+                    if user:
+                        ex("UPDATE users SET tg_chat=?, tg_code=NULL WHERE id=?", (chat, user["id"]))
+                        tg_send(chat, "Готово. Напоминания о тендерах будут приходить сюда.")
+                    else:
+                        tg_send(chat, "Ссылка устарела. Откройте калькулятор: Настройки, «Подключить Telegram».")
+                elif chat and text.startswith("/start"):
+                    tg_send(chat, "Чтобы получать напоминания, откройте калькулятор: Настройки, «Подключить Telegram».")
+        except Exception as e:
+            sys.stderr.write(f"telegram poll: {e!r}\n")
+            time.sleep(15)
+
+
+def fmt_rub(v):
+    return f"{v:,.0f} ₽".replace(",", " ") if isinstance(v, (int, float)) else "—"
+
+
+def tender_text(t, head):
+    left = ""
+    if t.get("deadline_ts"):
+        sec = t["deadline_ts"] - now()
+        left = f" (осталось {sec // 86400} дн. {sec % 86400 // 3600} ч.)" if sec > 0 else " (срок прошёл)"
+    lines = [head, t.get("title") or "Без названия"]
+    if t.get("number"):
+        lines.append(f"№ {t['number']}")
+    if t.get("deadline"):
+        lines.append(f"Подача до: {t['deadline']}{left}")
+    if t.get("cost"):
+        lines.append(f"Закупка: {fmt_rub(t['cost'])}")
+    if t.get("price"):
+        lines.append(f"Наша цена: {fmt_rub(t['price'])}")
+    if t.get("profit") is not None and t.get("margin") is not None:
+        lines.append(f"Чистая прибыль: {fmt_rub(t['profit'])}, маржа {t['margin']:.1f}%".replace(".", ","))
+    if t.get("stage"):
+        lines.append(f"Следующий шаг: {t['stage']}")
+    if PUBLIC_URL:
+        lines.append(f"{PUBLIC_URL}/#/t/{t['id']}")
+    elif t.get("url"):
+        lines.append(t["url"])
+    return "\n".join(lines)
+
+
+def reminder_loop():
+    while True:
+        try:
+            for r in q("""SELECT r.*, u.tg_chat FROM reminders r JOIN users u ON u.id=r.user_id
+                          WHERE r.sent=0 AND r.at<=? LIMIT 50""", (now(),)):
+                t = q("SELECT * FROM tenders WHERE id=?", (r["tender_id"],), one=True)
+                if r["tg_chat"] and t:
+                    tg_send(r["tg_chat"], tender_text(t, "⏰ " + (r["text"] or "Напоминание")))
+                ex("UPDATE reminders SET sent=1 WHERE id=?", (r["id"],))
+            for kind, window, head in (("d1", 86400, "⏰ Завтра окончание подачи заявок"), ("h3", 3 * 3600, "⏰ Через 3 часа окончание подачи заявок")):
+                for t in q(f"""SELECT t.*, u.tg_chat FROM tenders t JOIN users u ON u.id=t.user_id
+                               WHERE u.tg_chat IS NOT NULL AND t.deadline_ts IS NOT NULL AND t.deadline_ts > ? AND t.deadline_ts <= ?
+                               AND t.status IN ('draft', 'submitted')
+                               AND NOT EXISTS (SELECT 1 FROM notified n WHERE n.tender_id=t.id AND n.kind=?) LIMIT 50""",
+                           (now(), now() + window, kind)):
+                    tg_send(t["tg_chat"], tender_text(t, head))
+                    ex("INSERT OR IGNORE INTO notified(tender_id, kind) VALUES (?,?)", (t["id"], kind))
+        except Exception as e:
+            sys.stderr.write(f"reminders: {e!r}\n")
+        time.sleep(60)
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     if cmd == "users":
@@ -814,6 +1078,9 @@ def main():
         print(token)
         return
     db()
+    threading.Thread(target=reminder_loop, daemon=True).start()
+    if TG_TOKEN:
+        threading.Thread(target=tg_poll, daemon=True).start()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
     print(f"Тендерный калькулятор: http://{HOST}:{PORT}" + ("" if INVITE else "  (приглашение не задано: войти может любой)"), flush=True)
