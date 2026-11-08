@@ -33,6 +33,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import market
+import pricein
 import tparse as tparser
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -959,7 +960,8 @@ def api_price_add(h, user):
     rows = b.get("rows") if isinstance(b.get("rows"), list) else [b]
     if q("SELECT COUNT(*) AS n FROM prices WHERE user_id=?", (user["id"],), one=True)["n"] + len(rows) > 20000:
         raise ApiError(400, "В прайсе слишком много строк")
-    added = 0
+    known = price_names(user)
+    added = updated = 0
     for r in rows[:5000]:
         if not isinstance(r, dict):
             continue
@@ -967,14 +969,89 @@ def api_price_add(h, user):
             name, unit, cost, note = price_fields(r)
         except ApiError:
             continue
-        exist = q("SELECT id FROM prices WHERE user_id=? AND name=? COLLATE NOCASE", (user["id"], name), one=True)
-        if exist:
-            ex("UPDATE prices SET unit=?, cost=?, note=?, updated=? WHERE id=?", (unit, cost, note, now(), exist["id"]))
+        pid = known.get(name.lower())
+        if pid:
+            ex("UPDATE prices SET unit=?, cost=?, note=?, updated=? WHERE id=?", (unit, cost, note, now(), pid))
+            updated += 1
         else:
-            ex("INSERT INTO prices(user_id, name, unit, cost, note, updated) VALUES (?,?,?,?,?,?)",
-               (user["id"], name, unit, cost, note, now()))
-        added += 1
-    h.send_json({"ok": True, "count": added})
+            known[name.lower()] = ex("INSERT INTO prices(user_id, name, unit, cost, note, updated) VALUES (?,?,?,?,?,?)",
+                                     (user["id"], name, unit, cost, note, now()))
+            added += 1
+    h.send_json({"ok": True, "count": added + updated, "added": added, "updated": updated})
+
+
+def price_names(user):
+    """Название в нижнем регистре → id. Python понимает регистр кириллицы, SQLite нет."""
+    return {r["name"].lower(): r["id"] for r in q("SELECT id, name FROM prices WHERE user_id=?", (user["id"],))}
+
+
+# ---------------------------------------------------------------- загрузка прайса из файла, текста, ссылки
+
+MAX_PRICE_FILE = 25 * 1024 * 1024
+_parse_lock = threading.Semaphore(2)  # распознавание картинок нагружает процессор
+
+
+def download_price(url):
+    if not re.match(r"https?://", url, re.I):
+        url = "https://" + url
+    try:
+        if pricein.is_yandex_disk(url):
+            try:
+                _, _, meta = fetch(pricein.YANDEX_API + urllib.parse.quote(url, safe=""), limit=200000)
+                href = json.loads(meta)["href"]
+            except (FetchError, ValueError, KeyError, TypeError):
+                raise ApiError(400, "Яндекс.Диск не отдал файл. Проверьте, что ссылка публичная (Поделиться → Скопировать ссылку)")
+            final, headers, data = fetch(href, limit=MAX_PRICE_FILE, timeout=90)
+        else:
+            final, headers, data = fetch(pricein.cloud_download_url(url), limit=MAX_PRICE_FILE, timeout=90)
+    except FetchError as e:
+        msg = str(e)
+        if "не пустила" in msg:
+            msg = "Нет доступа к файлу. Откройте доступ «всем, у кого есть ссылка»"
+        elif "большой" in msg:
+            msg = "Файл больше 25 МБ"
+        raise ApiError(400, msg)
+    name = filename_from_headers(headers) or urllib.parse.unquote(urllib.parse.urlsplit(final).path.rsplit("/", 1)[-1])
+    return name or "файл", data
+
+
+@route("POST", r"/api/prices/parse")
+def api_price_parse(h, user):
+    """Распознаёт прайс и возвращает строки для проверки. В прайс ничего не записывает."""
+    if too_many(str(user["id"]), "parse", 150):
+        raise ApiError(429, "Слишком много загрузок за час. Попробуйте позже")
+    hit(str(user["id"]), "parse")
+    text = None
+    if (h.headers.get("Content-Type") or "").startswith("application/json"):
+        b = h.json_body()
+        if str(b.get("url") or "").strip():
+            name, data = download_price(str(b["url"]).strip())
+        elif str(b.get("text") or "").strip():
+            name, text = "текст", str(b["text"])[:3000000]
+        else:
+            raise ApiError(400, "Нет ни файла, ни ссылки, ни текста")
+    else:
+        if int(h.headers.get("Content-Length") or 0) > MAX_PRICE_FILE:
+            raise ApiError(413, "Файл больше 25 МБ")
+        name = urllib.parse.unquote(h.headers.get("X-File-Name") or "файл")[:200]
+        data = h.body_bytes(MAX_PRICE_FILE)
+        if not data:
+            raise ApiError(400, "Пустой файл")
+    with _parse_lock:
+        try:
+            if text is not None:
+                items, source, warns = pricein.parse_text(text), "текст", []
+            else:
+                items, source, warns = pricein.parse_bytes(name, data)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            items, source, warns = [], "файл", ["Не получилось прочитать файл. Попробуйте другой формат"]
+    known = price_names(user)
+    rows = [dict(it, exists=it["name"].lower() in known) for it in items[:3000]]
+    if not rows and not warns:
+        warns.append("Не нашли строк с ценами. Нужны название и цена в одной строке")
+    h.send_json({"rows": rows, "source": source, "warnings": warns, "file": name})
 
 
 @route("PUT", r"/api/prices/(\d+)")

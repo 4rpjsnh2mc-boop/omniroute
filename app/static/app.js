@@ -1164,7 +1164,9 @@ function renderMarket() {
   box.innerHTML = html;
 }
 
-/* ---------- прайс ---------- */
+/* ---------- мой прайс ---------- */
+let IMP = null; // распознанные строки, ждут проверки: {rows:[{name,unit,cost,note,exists,on}], from:[], warns:[]}
+const IMP_ACCEPT = ".xlsx,.docx,.pdf,.csv,.txt,.tsv,.zip,image/*";
 async function viewPrices() {
   await loadPrices();
   app.innerHTML = `
@@ -1172,13 +1174,28 @@ async function viewPrices() {
       <div class="card-h"><h1>Мой прайс</h1><span class="muted small">Ваши закупочные цены. Видны только вам и подставляются в тендеры по названию.</span></div>
       <div class="row">
         <div class="inp grow"><input id="p-search" placeholder="Поиск" aria-label="Поиск по прайсу"></div>
-        <button class="btn primary" id="p-add" type="button">Добавить</button>
-        <button class="btn" id="p-imp-t" type="button">Вставить из Excel</button>
+        <button class="btn" id="p-add" type="button">Добавить вручную</button>
+        <button class="btn primary" id="p-imp-t" type="button" aria-expanded="false">Загрузить прайс</button>
       </div>
-      <div id="p-imp" hidden style="margin-top:12px">
-        <p class="hint" style="margin-bottom:6px">Скопируйте в Excel столбцы <b>Наименование</b>, <b>Ед.</b>, <b>Цена</b>, Примечание и вставьте сюда. Совпавшие по названию строки обновятся.</p>
-        <textarea id="p-paste" rows="6" placeholder="Масло И-40А, бочка 180 кг	кг	135	поставщик ООО «…»"></textarea>
-        <div class="row" style="margin-top:8px"><button class="btn primary" id="p-imp-go" type="button">Добавить в прайс</button><span class="small muted" id="p-imp-st"></span></div>
+      <div id="p-imp" hidden>
+        <div class="imp">
+          <label class="drop" id="p-drop">
+            <input type="file" id="p-file" accept="${IMP_ACCEPT}" multiple>
+            <b>Выберите файл или перетащите сюда</b>
+            <span class="hint">Excel, Word, PDF, CSV, архив, скриншот или фото прайса. С телефона можно сразу сфотографировать.</span>
+            <span class="hint">Скриншот можно не сохранять: скопируйте его и нажмите <b>Ctrl+V</b> на этой странице.</span>
+          </label>
+          <div class="imp-side">
+            <label class="lbl" for="p-url">Ссылка на облако или сайт поставщика</label>
+            <div class="row"><div class="inp grow"><input id="p-url" inputmode="url" placeholder="disk.yandex.ru/…, docs.google.com/…"></div><button class="btn" id="p-url-go" type="button">Загрузить</button></div>
+            <span class="hint">Яндекс.Диск, Google Таблицы, Google Документы, Google Диск, Dropbox, страница прайса на сайте или прямая ссылка на файл. Откройте доступ «всем, у кого есть ссылка».</span>
+            <label class="lbl" for="p-paste" style="margin-top:10px">Или вставьте текст</label>
+            <textarea id="p-paste" rows="4" placeholder="Из Excel, Word, письма или мессенджера. В строке: название, ед., цена"></textarea>
+            <div class="row"><button class="btn" id="p-text-go" type="button">Распознать текст</button></div>
+          </div>
+        </div>
+        <p class="small muted" id="p-st" role="status" style="margin-top:10px"></p>
+        <div id="p-prev"></div>
       </div>
     </div>
     <div class="card" style="padding:0"><div class="table-wrap" style="border:0"><table class="items" style="min-width:720px">
@@ -1193,7 +1210,7 @@ async function viewPrices() {
       <td><input data-pf="cost" class="n" inputmode="decimal" value="${fmtIn(p.cost)}" aria-label="Цена"></td>
       <td><input data-pf="note" value="${esc(p.note)}" aria-label="Примечание"></td>
       <td><button class="icon" type="button" data-del="${p.id}" aria-label="Удалить">×</button></td></tr>`).join("")
-      || `<tr><td colspan="5" class="muted" style="padding:14px">Прайс пуст. Добавьте позиции или вставьте из Excel.</td></tr>`;
+      || `<tr><td colspan="5" class="muted" style="padding:14px">Прайс пуст. Добавьте позиции вручную или загрузите прайс поставщика.</td></tr>`;
   };
   render();
   $("#p-search").oninput = render;
@@ -1220,19 +1237,132 @@ async function viewPrices() {
       if (last) { const i = $("input", last); i.focus(); i.select(); }
     } catch (ex) { toast(ex.message); }
   };
-  $("#p-imp-t").onclick = () => { $("#p-imp").hidden = !$("#p-imp").hidden; };
-  $("#p-imp-go").onclick = async () => {
-    const t = $("#p-paste").value;
-    const delim = t.includes("\t") ? "\t" : t.includes(";") ? ";" : ",";
-    let rows = t.split(/\r?\n/).map((l) => l.split(delim).map((c) => c.trim())).filter((r) => r.some(Boolean));
-    if (rows.length && !(num(rows[0][2]) > 0) && /наимен|назван|цена/i.test(rows[0].join(" "))) rows = rows.slice(1);
-    const out = rows.map((r) => ({ name: r[0], unit: r[1] || "", cost: num(r[2]), note: r[3] || "" })).filter((r) => r.name && r.cost > 0);
-    if (!out.length) return toast("Не нашёл строк с названием и ценой");
+  const openImp = (open) => { $("#p-imp").hidden = !open; $("#p-imp-t").setAttribute("aria-expanded", String(open)); };
+  $("#p-imp-t").onclick = () => openImp($("#p-imp").hidden);
+  $("#p-file").onchange = (e) => { const fs = [...e.target.files]; e.target.value = ""; impFiles(fs); };
+  const drop = $("#p-drop");
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); impFiles([...e.dataTransfer.files]); };
+  $("#p-url-go").onclick = () => { const u = $("#p-url").value.trim(); if (!u) return toast("Вставьте ссылку"); impParse({ url: u }, "ссылка"); };
+  $("#p-url").onkeydown = (e) => { if (e.key === "Enter") $("#p-url-go").click(); };
+  $("#p-text-go").onclick = () => { const t = $("#p-paste").value; if (!t.trim()) return toast("Вставьте текст прайса"); impParse({ text: t }, "текст"); };
+  viewPrices.render = render;
+  viewPrices.open = openImp;
+  if (IMP && IMP.rows.length) { openImp(true); renderImp(); }
+}
+
+// Скриншот из буфера обмена (Ctrl+V) на странице прайса
+document.addEventListener("paste", (e) => {
+  if (!$("#p-imp")) return;
+  const files = [...(e.clipboardData ? e.clipboardData.files : [])].filter((f) => f.type.startsWith("image/") || f.name);
+  if (files.length) {
+    e.preventDefault();
+    viewPrices.open(true);
+    impFiles(files.map((f, i) => (f.name && f.name !== "image.png" ? f : new File([f], `скриншот-${i + 1}.png`, { type: f.type || "image/png" }))));
+    return;
+  }
+  const el = e.target;
+  if (el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return; // обычная вставка в поле
+  const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+  if (text && /\d/.test(text) && text.trim().length > 4) {
+    e.preventDefault();
+    viewPrices.open(true);
+    $("#p-paste").value = text;
+    impParse({ text }, "текст");
+  }
+});
+
+async function impFiles(files) {
+  files = files.filter(Boolean);
+  if (!files.length) return;
+  for (const f of files) {
+    if (f.size > 25 * 1024 * 1024) { impStatus(`${f.name}: файл больше 25 МБ`); continue; }
+    await impParse(f, f.name);
+  }
+}
+function impStatus(text) { const s = $("#p-st"); if (s) s.textContent = text; }
+let impBusy = 0;
+async function impParse(body, label) {
+  impBusy++;
+  const slow = body instanceof Blob && (/^image\//.test(body.type) || /\.(pdf|png|jpe?g|webp)$/i.test(body.name || ""));
+  impStatus(`Читаем ${label}…${slow ? " Распознавание картинки занимает до минуты." : ""}`);
+  try {
+    const r = body instanceof Blob
+      ? await api("POST", "/api/prices/parse", body, { "X-File-Name": encodeURIComponent(body.name || "файл"), "Content-Type": "application/octet-stream" })
+      : await api("POST", "/api/prices/parse", body);
+    IMP = IMP || { rows: [], from: [], warns: [] };
+    const at = new Map(IMP.rows.map((x, i) => [x.name.toLowerCase(), i]));
+    for (const row of r.rows) {
+      const it = { name: row.name, unit: row.unit || "", cost: row.cost, note: row.note || "", exists: row.exists, on: true };
+      const k = it.name.toLowerCase();
+      if (at.has(k)) IMP.rows[at.get(k)] = it; else { at.set(k, IMP.rows.length); IMP.rows.push(it); }
+    }
+    IMP.from.push(`${label === "ссылка" || label === "текст" ? label : r.source} — ${r.rows.length} ${plural(r.rows.length, "строка", "строки", "строк")}`);
+    for (const w of r.warnings || []) if (!IMP.warns.includes(w)) IMP.warns.push(w);
+    if (label === "текст" && r.rows.length) $("#p-paste").value = "";
+    if (label === "ссылка" && r.rows.length) $("#p-url").value = "";
+    impStatus(r.rows.length ? "" : (r.warnings && r.warnings[0]) || "Не нашли строк с ценами");
+  } catch (ex) {
+    impStatus(`${label}: ${ex.message}`);
+  } finally {
+    impBusy--;
+  }
+  renderImp();
+}
+function renderImp() {
+  const box = $("#p-prev");
+  if (!box) return;
+  if (!IMP || !IMP.rows.length) { box.innerHTML = IMP && IMP.warns.length ? `<p class="note warn">${IMP.warns.map(esc).join("<br>")}</p>` : ""; return; }
+  const on = IMP.rows.filter((x) => x.on);
+  const upd = on.filter((x) => x.exists).length;
+  box.innerHTML = `
+    <div class="imp-head"><h2>Проверьте перед добавлением</h2><span class="small muted">${IMP.from.map(esc).join(" · ")}</span></div>
+    ${IMP.warns.length ? `<p class="note warn" style="margin-bottom:10px">${IMP.warns.map(esc).join("<br>")}</p>` : ""}
+    <div class="table-wrap"><table class="items" style="min-width:720px">
+      <thead><tr><th style="width:36px"><input type="checkbox" id="imp-all" aria-label="Выбрать все"${on.length === IMP.rows.length ? " checked" : ""}></th>
+        <th>Наименование</th><th style="width:90px">Ед.</th><th class="r" style="width:130px">Цена</th><th style="width:200px">Примечание</th><th style="width:96px"></th></tr></thead>
+      <tbody id="imp-body">${IMP.rows.map((x, i) => `<tr data-i="${i}"${x.on ? "" : ' class="off"'}>
+        <td><input type="checkbox" data-if="on" aria-label="Добавить строку"${x.on ? " checked" : ""}></td>
+        <td><input data-if="name" value="${esc(x.name)}" aria-label="Наименование"></td>
+        <td><input data-if="unit" value="${esc(x.unit)}" aria-label="Ед."></td>
+        <td><input data-if="cost" class="n" inputmode="decimal" value="${fmtIn(x.cost)}" aria-label="Цена"></td>
+        <td><input data-if="note" value="${esc(x.note)}" aria-label="Примечание"></td>
+        <td>${x.exists ? '<span class="pill warn" title="Такая позиция уже есть в прайсе, цена обновится">обновит</span>' : '<span class="pill good">новая</span>'}</td></tr>`).join("")}</tbody></table></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn primary" id="imp-go" type="button"${on.length ? "" : " disabled"}>Добавить в прайс (${on.length})</button>
+      <button class="btn" id="imp-cancel" type="button">Очистить</button>
+      <span class="small muted">${upd ? `${upd} ${plural(upd, "позиция обновится", "позиции обновятся", "позиций обновятся")}, остальные добавятся` : "Все позиции новые"}</span>
+    </div>`;
+  $("#imp-body").oninput = (e) => {
+    const tr = e.target.closest("tr[data-i]"), f = e.target.dataset.if;
+    if (!tr || !f || f === "on") return;
+    const x = IMP.rows[+tr.dataset.i];
+    if (f === "cost") x.cost = num(e.target.value);
+    else x[f] = e.target.value;
+    if (f === "name") x.exists = priceIndex.has(x.name.trim().toLowerCase());
+  };
+  $("#imp-body").onchange = (e) => {
+    const tr = e.target.closest("tr[data-i]"), f = e.target.dataset.if;
+    if (!tr || !f) return;
+    if (f === "on") IMP.rows[+tr.dataset.i].on = e.target.checked;
+    renderImp();
+  };
+  $("#imp-all").onchange = (e) => { IMP.rows.forEach((x) => { x.on = e.target.checked; }); renderImp(); };
+  $("#imp-cancel").onclick = () => { IMP = null; impStatus(""); renderImp(); };
+  $("#imp-go").onclick = async () => {
+    const rows = IMP.rows.filter((x) => x.on && x.name.trim()).map(({ name, unit, cost, note }) => ({ name: name.trim(), unit, cost, note }));
+    if (!rows.length) return;
+    $("#imp-go").disabled = true;
     try {
-      const r = await api("POST", "/api/prices", { rows: out });
-      $("#p-imp-st").textContent = `Готово: ${r.count}`; $("#p-paste").value = "";
-      await loadPrices(); render();
-    } catch (ex) { toast(ex.message); }
+      const r = await api("POST", "/api/prices", { rows });
+      IMP = null;
+      await loadPrices();
+      if (viewPrices.render) { $("#p-search").value = ""; viewPrices.render(); }
+      renderImp();
+      impStatus(`Готово: добавлено ${r.added}, обновлено ${r.updated}`);
+      toast(`Прайс обновлён: +${r.added}, изменено ${r.updated}`);
+    } catch (ex) { toast(ex.message); $("#imp-go").disabled = false; }
   };
 }
 

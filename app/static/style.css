@@ -185,3 +185,16 @@ a.doc:hover { border-color: var(--accent); }
 .pl-h { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
 .pl-h a { color: var(--ink); text-decoration: none; }
 .pl-kinds { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* загрузка прайса */
+.imp { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 14px; margin-top: 12px; }
+@media (max-width: 760px) { .imp { grid-template-columns: minmax(0, 1fr); } }
+.drop { position: relative; display: grid; align-content: center; justify-items: center; gap: 6px; text-align: center; min-height: 170px; padding: 18px;
+  border: 2px dashed var(--line); border-radius: 10px; background: var(--surface-2); cursor: pointer; }
+.drop:hover, .drop.over, .drop:focus-within { border-color: var(--accent); background: var(--accent-soft); }
+.drop input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.drop b { font-size: 15px; }
+.imp-side { display: grid; gap: 6px; align-content: start; }
+.imp-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 14px 0 8px; }
+.items tr.off input:not([type="checkbox"]) { color: var(--ink-3); text-decoration: line-through; }
+.items input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--accent); }

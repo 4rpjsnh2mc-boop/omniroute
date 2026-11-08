@@ -32,6 +32,15 @@ if ! command -v python3 >/dev/null; then apt-get update -y && apt-get install -y
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || die "нужен Python 3.10 или новее."
 command -v curl >/dev/null || apt-get install -y curl
 ok "Python $(python3 -c 'import platform; print(platform.python_version())')"
+# распознавание прайсов: скриншоты и фото (tesseract), PDF (poppler), подготовка картинок (imagemagick)
+if ! command -v tesseract >/dev/null || ! command -v pdftotext >/dev/null || ! command -v convert >/dev/null; then
+  echo "Ставлю программы для чтения прайсов со скриншотов и из PDF..."
+  if (apt-get update -y >/dev/null && apt-get install -y tesseract-ocr tesseract-ocr-rus poppler-utils imagemagick >/dev/null); then
+    ok "Распознавание прайсов готово"
+  else
+    echo "Не получилось поставить распознавание текста. Excel, Word и текст работают и без него."
+  fi
+fi
 
 say "2/6. Скачиваю программу"
 TMP="$(mktemp -d)"
