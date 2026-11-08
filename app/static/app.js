@@ -43,7 +43,7 @@ function toast(text, action, fn) {
 }
 
 /* ---------- API ---------- */
-let ME = null, SETTINGS = null, PRICES = [], priceIndex = new Map();
+let ME = null, SETTINGS = null, KEY = "", PRICES = [], priceIndex = new Map(), JUST_JOINED = false;
 async function api(method, path, body, headers = {}) {
   const h = { "X-Tender": "1", ...headers };
   let payload;
@@ -54,7 +54,7 @@ async function api(method, path, body, headers = {}) {
   catch (e) { throw new Error("Нет связи с сервером. Проверьте интернет"); }
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
-  if (res.status === 401 && path !== "/api/login") { ME = null; showLogin(); throw new Error("Войдите в систему"); }
+  if (res.status === 401) { ME = null; showStart(""); throw new Error((data && data.error) || "Нет доступа"); }
   if (!res.ok) throw new Error((data && data.error) || "Ошибка сервера");
   return data;
 }
@@ -142,42 +142,67 @@ function compute(d) {
   return { b, be, tg, P, cur, beDisc, tgDisc, target, has, nm: b.nmck > 0 ? calcAt(b, b.nmck) : null };
 }
 
-/* ---------- вход ---------- */
-function showLogin() {
+/* ---------- вход по ссылке ---------- */
+const personalLink = () => `${location.origin}/#/key/${KEY}`;
+function showStart(code) {
   $("#top").hidden = true;
-  app.innerHTML = `<div class="login"><form class="card" id="login-f">
-    <div><h1>Вход</h1><p class="muted">Тендерный калькулятор</p></div>
-    <div class="field"><label for="l-login">Логин</label><div class="inp"><input id="l-login" autocomplete="username" autocapitalize="none" required></div></div>
-    <div class="field"><label for="l-pass">Пароль</label><div class="inp"><input id="l-pass" type="password" autocomplete="current-password" required></div></div>
-    <p class="err-msg" id="l-err" hidden></p>
-    <button class="btn primary" type="submit">Войти</button>
-    <p class="hint">Логин и пароль выдаёт администратор.</p></form></div>`;
-  $("#login-f").addEventListener("submit", async (e) => {
+  if (!code) {
+    app.innerHTML = `<div class="login"><div class="card">
+      <div><h1>Тендерный калькулятор</h1></div>
+      <p>Чтобы начать, откройте ссылку-приглашение, которую вам прислали.</p>
+      <p class="muted small">Если вы уже работали здесь с другого устройства, откройте свою личную ссылку: она есть в разделе «Настройки» на том устройстве.</p>
+    </div></div>`;
+    return;
+  }
+  app.innerHTML = `<div class="login"><form class="card" id="join-f">
+    <div><h1>Тендерный калькулятор</h1><p class="muted">Расчёт тендеров: позиции, налоги, маржа, цена для торгов</p></div>
+    <div class="field"><label for="j-name">Как вас зовут?</label><div class="inp"><input id="j-name" autocomplete="name" placeholder="Например, Иван Петров" maxlength="80"></div>
+      <span class="hint">Видно только вам. Можно оставить пустым.</span></div>
+    <p class="err-msg" id="j-err" hidden></p>
+    <button class="btn primary" type="submit">Начать работу</button>
+    <p class="hint">У вас будут свои тендеры и свой прайс. Другие люди с этой ссылкой их не увидят.</p></form></div>`;
+  $("#join-f").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const err = $("#l-err");
+    const err = $("#j-err");
     err.hidden = true;
     try {
-      await api("POST", "/api/login", { login: $("#l-login").value.trim(), password: $("#l-pass").value });
+      await api("POST", "/api/join", { code, name: $("#j-name").value.trim() });
+      JUST_JOINED = true;
+      history.replaceState(null, "", location.pathname + "#/");
       await boot();
     } catch (ex) { err.textContent = ex.message; err.hidden = false; }
   });
+}
+async function claimKey(key) {
+  try {
+    await api("POST", "/api/claim", { key });
+    history.replaceState(null, "", location.pathname + "#/");
+    await boot();
+    toast("Открыты ваши тендеры");
+  } catch (e) {
+    history.replaceState(null, "", location.pathname + "#/");
+    $("#top").hidden = true;
+    app.innerHTML = `<div class="login"><div class="card"><h1>Ссылка не подошла</h1><p>${esc(e.message)}</p></div></div>`;
+  }
 }
 
 /* ---------- навигация ---------- */
 let leaveHook = null;
 async function route() {
   if (leaveHook) { const f = leaveHook; leaveHook = null; await f(); }
-  if (!ME) return showLogin();
   const h = location.hash || "#/";
-  const page = h.startsWith("#/t/") ? "list" : h.startsWith("#/prices") ? "prices" : h.startsWith("#/admin") ? "admin" : h.startsWith("#/account") ? "account" : "list";
+  let km;
+  if ((km = h.match(/^#\/key\/([\w-]{10,100})/))) return claimKey(km[1]);
+  if (!ME) { const jm = h.match(/^#\/join\/([\w-]{4,100})/); return showStart(jm ? jm[1] : ""); }
+  if (h.startsWith("#/join/")) { history.replaceState(null, "", location.pathname + "#/"); }
+  const page = h.startsWith("#/t/") ? "list" : h.startsWith("#/prices") ? "prices" : h.startsWith("#/settings") ? "settings" : "list";
   $$("#nav a").forEach((a) => a.classList.toggle("on", a.dataset.nav === page));
   window.scrollTo(0, 0);
   let m;
   try {
     if ((m = h.match(/^#\/t\/(\d+)/))) return await viewTender(Number(m[1]));
     if (page === "prices") return await viewPrices();
-    if (page === "admin" && ME.isAdmin) return await viewAdmin();
-    if (page === "account") return viewAccount();
+    if (page === "settings") return viewSettings();
     return await viewList();
   } catch (e) {
     if (ME) app.innerHTML = `<div class="card"><p class="err-msg">${esc(e.message)}</p><p><a href="#/">К списку тендеров</a></p></div>`;
@@ -185,12 +210,14 @@ async function route() {
 }
 window.addEventListener("hashchange", route);
 async function boot() {
+  const h = location.hash || "";
+  const km = h.match(/^#\/key\/([\w-]{10,100})/);
+  if (km) return claimKey(km[1]);
   const r = await api("GET", "/api/me");
-  if (!r.user) return showLogin();
-  ME = r.user; SETTINGS = r.settings;
+  if (!r.user) { ME = null; return route(); }
+  ME = r.user; SETTINGS = r.settings; KEY = r.key || "";
   $("#top").hidden = false;
-  $("#nav-admin").hidden = !ME.isAdmin;
-  $("#nav-user").textContent = ME.name || ME.login;
+  $("#nav-user").textContent = ME.name ? `Настройки · ${ME.name}` : "Настройки";
   await loadPrices();
   route();
 }
@@ -210,6 +237,11 @@ function newData() {
 let pendingImport = null;
 async function viewList() {
   app.innerHTML = `
+    ${JUST_JOINED ? `<div class="card" style="border-color:var(--accent)">
+      <div class="card-h"><h2>Сохраните свою личную ссылку</h2><button class="btn sm" type="button" id="w-close">Понятно</button></div>
+      <p>По ней ваши тендеры откроются на телефоне или другом компьютере. Сохраните её себе в заметки или «Избранное» в мессенджере и никому не пересылайте.</p>
+      <div class="row" style="margin-top:10px"><div class="inp grow"><input id="w-link" readonly value="${esc(personalLink())}" aria-label="Личная ссылка"></div><button class="btn primary" type="button" id="w-copy">Копировать</button></div>
+      <p class="hint" style="margin-top:6px">Ссылку всегда можно найти в разделе «Настройки».</p></div>` : ""}
     <div class="card">
       <div class="card-h"><h1>Мои тендеры</h1></div>
       <form class="row" id="new-f">
@@ -235,6 +267,10 @@ async function viewList() {
     try { await create(url); } catch (ex) { toast(ex.message); }
   });
   $("#new-empty").addEventListener("click", () => create("").catch((ex) => toast(ex.message)));
+  if (JUST_JOINED) {
+    $("#w-copy").onclick = () => copyText(personalLink(), $("#w-link"));
+    $("#w-close").onclick = () => { JUST_JOINED = false; viewList(); };
+  }
   const { tenders } = await api("GET", "/api/tenders");
   const body = $("#t-body");
   if (!tenders.length) body.innerHTML = `<tr><td colspan="6" class="muted" style="padding:18px">Тендеров пока нет. Вставьте ссылку на закупку выше.</td></tr>`;
@@ -256,6 +292,10 @@ async function viewList() {
     st(decided ? pct((won.length / decided) * 100, 0) : "—", "доля побед"),
     st(won.length ? rub(won.reduce((a, t) => a + (t.price || 0), 0)) : "—", "сумма выигранных"),
   ].join("");
+}
+async function copyText(text, input) {
+  try { await navigator.clipboard.writeText(text); toast("Ссылка скопирована"); }
+  catch (e) { if (input) { input.focus(); input.select(); } toast("Выделите ссылку и скопируйте вручную"); }
 }
 
 /* ---------- тендер ---------- */
@@ -736,7 +776,7 @@ async function viewPrices() {
   await loadPrices();
   app.innerHTML = `
     <div class="card">
-      <div class="card-h"><h1>Прайс</h1><span class="muted small">Общий для всех сотрудников. Цены подставляются в тендеры по названию.</span></div>
+      <div class="card-h"><h1>Мой прайс</h1><span class="muted small">Ваши закупочные цены. Видны только вам и подставляются в тендеры по названию.</span></div>
       <div class="row">
         <div class="inp grow"><input id="p-search" placeholder="Поиск" aria-label="Поиск по прайсу"></div>
         <button class="btn primary" id="p-add" type="button">Добавить</button>
@@ -803,89 +843,67 @@ async function viewPrices() {
   };
 }
 
-/* ---------- сотрудники и настройки ---------- */
-async function viewAdmin() {
-  const { users } = await api("GET", "/api/users");
+/* ---------- настройки ---------- */
+function viewSettings() {
   const s = SETTINGS;
   app.innerHTML = `
     <div class="card">
-      <div class="card-h"><h1>Настройки компании</h1><span class="muted small">Применяются к новым тендерам</span></div>
-      <div class="fields" id="set-f">
+      <div class="card-h"><h1>Настройки</h1><span class="muted small">Применяются к новым тендерам</span></div>
+      <div class="fields">
+        <div class="field wide"><label for="s-name">Ваше имя</label><div class="inp"><input id="s-name" maxlength="80" value="${esc(ME.name)}"></div></div>
         <div class="field"><label for="s-regime">Налоговый режим</label><div class="inp"><select id="s-regime">${Object.entries(REGIMES).map(([k, v]) => `<option value="${k}"${s.tax.regime === k ? " selected" : ""}>${v}</option>`).join("")}</select></div></div>
-        <div class="field"><label for="s-usnvat">НДС на УСН</label><div class="inp"><select id="s-usnvat">${Object.entries(USN_VAT).map(([k, v]) => `<option value="${k}"${Number(s.tax.usnVat) === Number(k) ? " selected" : ""}>${v}</option>`).join("")}</select></div></div>
-        <div class="field"><label for="s-usnrate">Ставка УСН</label><div class="inp"><input id="s-usnrate" class="n" inputmode="decimal" value="${fmtIn(s.tax.usnRate, true)}"><span class="u">%</span></div></div>
+        <div class="field" id="s-usnvat-f"><label for="s-usnvat">НДС на УСН</label><div class="inp"><select id="s-usnvat">${Object.entries(USN_VAT).map(([k, v]) => `<option value="${k}"${Number(s.tax.usnVat) === Number(k) ? " selected" : ""}>${v}</option>`).join("")}</select></div></div>
+        <div class="field" id="s-usnrate-f"><label for="s-usnrate">Ставка УСН</label><div class="inp"><input id="s-usnrate" class="n" inputmode="decimal" value="${fmtIn(s.tax.usnRate, true)}"><span class="u">%</span></div></div>
         <div class="field"><label for="s-over">Накладные</label><div class="inp"><input id="s-over" class="n" inputmode="decimal" value="${fmtIn(s.overheadPct, true)}"><span class="u">%</span></div></div>
         <div class="field"><label for="s-target">Целевая маржа</label><div class="inp"><input id="s-target" class="n" inputmode="decimal" value="${fmtIn(s.targetPct, true)}"><span class="u">%</span></div></div>
         <div class="field"><label for="s-money">Стоимость денег</label><div class="inp"><input id="s-money" class="n" inputmode="decimal" value="${fmtIn(s.moneyRatePct, true)}"><span class="u">% год.</span></div></div>
         <div class="field"><label for="s-bg">Банковская гарантия</label><div class="inp"><input id="s-bg" class="n" inputmode="decimal" value="${fmtIn(s.bgRatePct, true)}"><span class="u">% год.</span></div></div>
       </div>
       <label class="check" style="margin-top:12px"><input type="checkbox" id="s-svat"${s.supplierVat ? " checked" : ""}> <span>Цены поставщиков обычно с НДС 22%</span></label>
-      <div class="row" style="margin-top:12px"><button class="btn primary" id="s-save" type="button">Сохранить настройки</button></div>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="s-save" type="button">Сохранить</button></div>
     </div>
     <div class="card">
-      <div class="card-h"><h2>Сотрудники</h2><span class="muted small">У каждого свои тендеры. Прайс общий.</span></div>
-      <form class="fields" id="u-add">
-        <div class="field"><label for="u-login">Логин</label><div class="inp"><input id="u-login" autocapitalize="none" placeholder="ivanov" required></div></div>
-        <div class="field"><label for="u-name">Имя</label><div class="inp"><input id="u-name" placeholder="Иван Иванов"></div></div>
-        <div class="field"><label for="u-pass">Пароль</label><div class="inp"><input id="u-pass" type="text" autocomplete="new-password" placeholder="не меньше 8 символов" required></div></div>
-        <div class="field"><label>&nbsp;</label><button class="btn primary" type="submit">Добавить сотрудника</button></div>
-      </form>
-      <label class="check" style="margin-top:8px"><input type="checkbox" id="u-admin"> <span>Администратор (может добавлять сотрудников и менять настройки)</span></label>
-      <div class="table-wrap" style="margin-top:14px"><table style="min-width:680px"><thead><tr><th>Логин</th><th>Имя</th><th class="r">Тендеров</th><th>Доступ</th><th>Новый пароль</th></tr></thead><tbody id="u-body"></tbody></table></div>
+      <div class="card-h"><h2>Личная ссылка</h2></div>
+      <p>Откройте её на телефоне или другом компьютере, и там будут ваши тендеры и прайс. Никому её не пересылайте: по ней открываются ваши данные.</p>
+      <div class="row" style="margin-top:10px"><div class="inp grow"><input id="k-link" readonly value="${esc(personalLink())}" aria-label="Личная ссылка"></div><button class="btn primary" type="button" id="k-copy">Копировать</button></div>
+      <div class="row" style="margin-top:14px"><span id="k-new-box"><button class="btn sm" type="button" id="k-new">Сменить ссылку</button></span><span class="hint">Старая ссылка перестанет работать на всех устройствах, кроме этого.</span></div>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>Выйти на этом устройстве</h2></div>
+      <p class="muted small">Без личной ссылки вернуться к своим тендерам будет нельзя. Сначала сохраните её.</p>
+      <div class="row" style="margin-top:10px"><span id="lo-box"><button class="btn sm danger" type="button" id="lo">Выйти</button></span></div>
     </div>`;
-  $("#u-body").innerHTML = users.map((u) => `<tr data-id="${u.id}">
-    <td>${esc(u.login)}${u.is_admin ? ' <span class="pill neutral">админ</span>' : ""}</td><td>${esc(u.name)}</td><td class="r">${u.tenders}</td>
-    <td>${u.id === ME.id ? '<span class="muted small">это вы</span>' : `<button class="btn sm" type="button" data-act="active">${u.active ? "Отключить" : "Включить"}</button> <button class="btn sm" type="button" data-act="admin">${u.is_admin ? "Снять админа" : "Сделать админом"}</button>`}</td>
-    <td><div class="row"><div class="inp" style="width:150px"><input data-pw placeholder="новый пароль" aria-label="Новый пароль"></div><button class="btn sm" type="button" data-act="pw">Сменить</button></div></td></tr>`).join("");
-  $("#u-body").onclick = async (e) => {
-    const b = e.target.closest("[data-act]");
-    if (!b) return;
-    const tr = b.closest("tr"), id = Number(tr.dataset.id), u = users.find((x) => x.id === id);
-    try {
-      if (b.dataset.act === "active") await api("PUT", "/api/users/" + id, { active: !u.active });
-      if (b.dataset.act === "admin") await api("PUT", "/api/users/" + id, { isAdmin: !u.is_admin });
-      if (b.dataset.act === "pw") { await api("PUT", "/api/users/" + id, { password: $("[data-pw]", tr).value }); toast("Пароль изменён"); }
-      viewAdmin();
-    } catch (ex) { toast(ex.message); }
+  const syncUsn = () => {
+    const usn = $("#s-regime").value !== "osno";
+    $("#s-usnvat-f").hidden = !usn; $("#s-usnrate-f").hidden = !usn;
+    if (usn && !num($("#s-usnrate").value)) $("#s-usnrate").value = $("#s-regime").value === "usn6" ? "6" : "15";
   };
-  $("#u-add").onsubmit = async (e) => {
-    e.preventDefault();
-    try {
-      await api("POST", "/api/users", { login: $("#u-login").value, name: $("#u-name").value, password: $("#u-pass").value, isAdmin: $("#u-admin").checked });
-      toast("Сотрудник добавлен. Передайте ему адрес сайта, логин и пароль");
-      viewAdmin();
-    } catch (ex) { toast(ex.message); }
-  };
+  syncUsn();
+  $("#s-regime").onchange = syncUsn;
   $("#s-save").onclick = async () => {
     try {
-      const r = await api("PUT", "/api/settings", {
-        tax: { regime: $("#s-regime").value, usnVat: num($("#s-usnvat").value), usnRate: num($("#s-usnrate").value) },
-        overheadPct: num($("#s-over").value), targetPct: num($("#s-target").value), moneyRatePct: num($("#s-money").value), bgRatePct: num($("#s-bg").value),
-        supplierVat: $("#s-svat").checked,
+      const r = await api("PUT", "/api/profile", {
+        name: $("#s-name").value,
+        settings: {
+          tax: { regime: $("#s-regime").value, usnVat: num($("#s-usnvat").value), usnRate: num($("#s-usnrate").value) },
+          overheadPct: num($("#s-over").value), targetPct: num($("#s-target").value), moneyRatePct: num($("#s-money").value), bgRatePct: num($("#s-bg").value),
+          supplierVat: $("#s-svat").checked,
+        },
       });
-      SETTINGS = r.settings; toast("Настройки сохранены");
+      ME = r.user; SETTINGS = r.settings;
+      $("#nav-user").textContent = ME.name ? `Настройки · ${ME.name}` : "Настройки";
+      toast("Сохранено");
     } catch (ex) { toast(ex.message); }
   };
+  $("#k-copy").onclick = () => copyText(personalLink(), $("#k-link"));
+  $("#k-new").onclick = (e) => confirmInline(e.currentTarget, "Сменить ссылку?", async () => {
+    const r = await api("POST", "/api/relink", {});
+    KEY = r.key; viewSettings(); toast("Новая ссылка готова. Сохраните её");
+  });
+  $("#lo").onclick = (e) => confirmInline(e.currentTarget, "Ссылка сохранена?", async () => {
+    await api("POST", "/api/logout", {});
+    ME = null; KEY = ""; history.replaceState(null, "", location.pathname + "#/"); showStart("");
+  });
 }
 
-/* ---------- аккаунт ---------- */
-function viewAccount() {
-  app.innerHTML = `<div class="card" style="max-width:520px">
-    <div class="card-h"><h1>${esc(ME.name || ME.login)}</h1><span class="muted small">Логин: ${esc(ME.login)}</span></div>
-    <form class="fields" id="pw-f">
-      <div class="field wide"><label for="pw-old">Текущий пароль</label><div class="inp"><input id="pw-old" type="password" autocomplete="current-password" required></div></div>
-      <div class="field wide"><label for="pw-new">Новый пароль</label><div class="inp"><input id="pw-new" type="password" autocomplete="new-password" required></div><span class="hint">Не меньше 8 символов</span></div>
-      <div class="field"><button class="btn primary" type="submit">Сменить пароль</button></div>
-    </form>
-    <div class="row" style="margin-top:18px"><button class="btn" id="logout" type="button">Выйти</button></div></div>`;
-  $("#pw-f").onsubmit = async (e) => {
-    e.preventDefault();
-    try { await api("POST", "/api/password", { old: $("#pw-old").value, new: $("#pw-new").value }); toast("Пароль изменён"); $("#pw-f").reset(); }
-    catch (ex) { toast(ex.message); }
-  };
-  $("#logout").onclick = async () => { try { await api("POST", "/api/logout", {}); } catch (e) { /* ignore */ } ME = null; location.hash = "#/"; showLogin(); };
-}
-
-app.addEventListener("input", onField);
-app.addEventListener("change", onField);
-boot().catch(() => showLogin());
+boot().catch(() => showStart(""));

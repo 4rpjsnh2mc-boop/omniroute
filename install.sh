@@ -4,7 +4,11 @@
 #   curl -fsSL https://raw.githubusercontent.com/4rpjsnh2mc-boop/omniroute/refs/heads/claude/ecstatic-lovelace-5myzzh/install.sh | sudo bash
 #
 # Повторный запуск той же команды обновляет программу. Данные (тендеры, документы,
-# пользователи) хранятся отдельно в /var/lib/tender и при обновлении не трогаются.
+# прайсы) хранятся отдельно в /var/lib/tender и при обновлении не трогаются.
+# После установки:  tender-link          — показать ссылку-приглашение
+#                   tender-link new      — выпустить новую (старая перестанет работать)
+#                   tender-link users    — список рабочих мест
+#                   tender-link user N   — новая личная ссылка для рабочего места N
 set -euo pipefail
 
 TARBALL="https://codeload.github.com/4rpjsnh2mc-boop/omniroute/tar.gz/refs/heads/claude/ecstatic-lovelace-5myzzh"
@@ -18,7 +22,7 @@ say() { printf '\n\033[1;33m%s\033[0m\n' "$*"; }
 ok() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 die() { printf '\n\033[1;31mОшибка: %s\033[0m\n' "$*" >&2; exit 1; }
 ask() { local reply=""; read -r -p "$1" reply < /dev/tty || true; printf '%s' "$reply"; }
-ask_secret() { local reply=""; read -r -s -p "$1" reply < /dev/tty || true; printf '\n' > /dev/tty; printf '%s' "$reply"; }
+set_env() { if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"; else printf '%s=%s\n' "$1" "$2" >> "$ENV_FILE"; fi; }
 
 [ "$(id -u)" -eq 0 ] || die "запустите от имени root (через sudo)."
 command -v apt-get >/dev/null || die "нужен Ubuntu или Debian."
@@ -77,11 +81,13 @@ if [ ! -f "$ENV_FILE" ]; then
   else
     printf 'TENDER_DATA=%s\nTENDER_HOST=0.0.0.0\nTENDER_PORT=%s\nTENDER_DOMAIN=\n' "$DATA_DIR" "$PORT_PUBLIC" > "$ENV_FILE"
   fi
-  chmod 644 "$ENV_FILE"
 else
   say "4/6. Настройки уже есть ($ENV_FILE), оставляю как есть"
   DOMAIN="$(grep -E '^TENDER_DOMAIN=' "$ENV_FILE" | cut -d= -f2- || true)"
 fi
+grep -q '^TENDER_INVITE=.\+' "$ENV_FILE" || set_env TENDER_INVITE "$(python3 -c 'import secrets; print(secrets.token_urlsafe(9))')"
+chown root:tender "$ENV_FILE"
+chmod 640 "$ENV_FILE"
 
 say "5/6. Запускаю службу"
 cat > /etc/systemd/system/${SVC}.service <<UNIT
@@ -114,6 +120,8 @@ sleep 2
 systemctl is-active --quiet "$SVC" || { journalctl -u "$SVC" -n 30 --no-pager; die "служба не запустилась."; }
 ok "Служба $SVC работает"
 
+HTTPS_OK=0
+[ -n "$DOMAIN" ] && [ -d "/etc/letsencrypt/live/$DOMAIN" ] && HTTPS_OK=1
 if [ -n "$DOMAIN" ]; then
   if [ ! -f /etc/nginx/conf.d/tender.conf ]; then
     cat > /etc/nginx/conf.d/tender.conf <<NGINX
@@ -138,6 +146,7 @@ NGINX
       EMAIL="$(ask 'E-mail для сертификата HTTPS (или Enter): ' | tr -d '[:space:]')"
       if [ -n "$EMAIL" ]; then CB_MAIL=(-m "$EMAIL"); else CB_MAIL=(--register-unsafely-without-email); fi
       if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --redirect "${CB_MAIL[@]}"; then
+        HTTPS_OK=1
         ok "HTTPS включён"
       else
         echo "HTTPS не включился: проверьте, что поддомен $DOMAIN указывает на IP этого сервера, и запустите установку ещё раз."
@@ -159,7 +168,7 @@ cat > /etc/cron.daily/tender-backup <<'CRON'
 cd /var/lib/tender || exit 0
 python3 - <<'PY'
 import sqlite3, time
-src = sqlite3.connect("/var/lib/tender/tender.db")
+src = sqlite3.connect("/var/lib/tender/app.db")
 dst = sqlite3.connect("/var/lib/tender/backups/tender-%s.db" % time.strftime("%Y-%m-%d"))
 src.backup(dst)
 dst.close(); src.close()
@@ -169,32 +178,60 @@ chown -R tender:tender /var/lib/tender/backups
 CRON
 chmod 755 /etc/cron.daily/tender-backup
 
-say "6/6. Администратор"
-USERS="$(sudo -u tender env TENDER_DATA="$DATA_DIR" python3 "$APP_DIR/app/server.py" count-users 2>/dev/null || echo 0)"
-if [ "$USERS" = "0" ]; then
-  LOGIN="$(ask 'Логин администратора [admin]: ' | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
-  LOGIN="${LOGIN:-admin}"
-  while true; do
-    P1="$(ask_secret 'Пароль (не меньше 8 символов, не отображается): ')"
-    P2="$(ask_secret 'Повторите пароль: ')"
-    [ "$P1" = "$P2" ] && [ "${#P1}" -ge 8 ] && break
-    echo "Пароли не совпадают или короче 8 символов. Ещё раз."
-  done
-  sudo -u tender env TENDER_DATA="$DATA_DIR" TENDER_ADMIN_PASSWORD="$P1" python3 "$APP_DIR/app/server.py" create-admin "$LOGIN"
-  unset P1 P2
-else
-  ok "Пользователи уже есть: $USERS"
-fi
-
+say "6/6. Ссылка для работы"
 IP="$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
+if [ -n "$DOMAIN" ]; then
+  if [ "$HTTPS_OK" = "1" ]; then PUBLIC="https://${DOMAIN}"; else PUBLIC="http://${DOMAIN}"; fi
+else
+  PUBLIC="http://${IP}:${PORT_PUBLIC}"
+fi
+set_env TENDER_PUBLIC_URL "$PUBLIC"
+
+cat > /usr/local/bin/tender-link <<'LINK'
+#!/bin/sh
+# Ссылки тендерного калькулятора. Запускать от root.
+set -e
+ENV=/etc/tender.env
+. "$ENV"
+APP=/opt/tender/app/server.py
+case "${1:-}" in
+  new)
+    CODE="$(python3 -c 'import secrets; print(secrets.token_urlsafe(9))')"
+    sed -i "s|^TENDER_INVITE=.*|TENDER_INVITE=$CODE|" "$ENV"
+    systemctl restart tender
+    TENDER_INVITE="$CODE"
+    echo "Старая ссылка-приглашение больше не работает (уже созданные рабочие места остаются). Новая:"
+    ;;
+  users)
+    runuser -u tender -- env TENDER_DATA="$TENDER_DATA" python3 "$APP" users
+    exit 0
+    ;;
+  user)
+    KEY="$(runuser -u tender -- env TENDER_DATA="$TENDER_DATA" python3 "$APP" relink "$2")"
+    echo "Новая личная ссылка для рабочего места $2 (старая перестала работать):"
+    echo "${TENDER_PUBLIC_URL}/#/key/${KEY}"
+    exit 0
+    ;;
+  *)
+    echo "Ссылка-приглашение. Отправьте её тем, кто будет работать:"
+    ;;
+esac
+echo "${TENDER_PUBLIC_URL}/#/join/${TENDER_INVITE}"
+LINK
+chmod 755 /usr/local/bin/tender-link
+INVITE="$(grep -E '^TENDER_INVITE=' "$ENV_FILE" | cut -d= -f2-)"
+
 echo
 echo "=============================================================="
-if [ -n "$DOMAIN" ]; then
-  ok "Готово. Откройте: https://${DOMAIN}  (если HTTPS не включился: http://${DOMAIN})"
-else
-  ok "Готово. Откройте: http://${IP}:${PORT_PUBLIC}"
-  echo "Если страница не открывается, разрешите входящий порт ${PORT_PUBLIC} в панели Рег.облака (вкладка «Сеть»)."
+ok "Готово. Ссылка для работы (отправьте её тем, кому нужен калькулятор):"
+echo
+echo "    ${PUBLIC}/#/join/${INVITE}"
+echo
+if [ -z "$DOMAIN" ]; then
+  echo "Если ссылка не открывается, разрешите входящий порт ${PORT_PUBLIC} в панели Рег.облака."
 fi
-echo "Обновить программу: запустите эту же команду ещё раз."
+echo "Показать ссылку ещё раз:           tender-link"
+echo "Выпустить новую (старая отключится): tender-link new"
+echo "Обновить программу: запустите команду установки ещё раз."
 echo "Данные и документы: ${DATA_DIR}  (копии базы: ${DATA_DIR}/backups)"
 echo "=============================================================="

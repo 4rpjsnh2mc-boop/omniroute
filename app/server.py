@@ -3,11 +3,16 @@
 
 Только стандартная библиотека Python 3.10+. Данные: SQLite + файлы документов в TENDER_DATA.
 
-Запуск:            python3 server.py serve
-Создать админа:    python3 server.py create-admin <логин>   (пароль спросит)
+Запуск:                 python3 server.py serve
+Список рабочих мест:    python3 server.py users
+Новая личная ссылка:    python3 server.py relink <id>
+
+Доступ: человек открывает ссылку-приглашение (в ней код TENDER_INVITE), вводит имя
+и получает своё рабочее место: свои тендеры, свой прайс, свои настройки. Ключ рабочего
+места хранится в cookie браузера; личная ссылка с этим ключом открывает то же место
+на другом устройстве.
 """
 
-import getpass
 import hashlib
 import hmac
 import ipaddress
@@ -33,9 +38,10 @@ STATIC = os.path.join(BASE, "static")
 DATA = os.environ.get("TENDER_DATA", os.path.join(BASE, "..", "data"))
 HOST = os.environ.get("TENDER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("TENDER_PORT", "8090"))
-DB_PATH = os.path.join(DATA, "tender.db")
+DB_PATH = os.path.join(DATA, "app.db")
+INVITE = os.environ.get("TENDER_INVITE", "").strip()
 FILES = os.path.join(DATA, "files")
-SESSION_DAYS = 30
+COOKIE_DAYS = 400
 COOKIE = "tsid"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 MAX_PAGE = 15 * 1024 * 1024
@@ -71,12 +77,8 @@ def db():
         _db.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
-              id INTEGER PRIMARY KEY, login TEXT UNIQUE NOT NULL, name TEXT NOT NULL DEFAULT '',
-              pass_hash TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
-              created INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS sessions (
-              token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-              expires INTEGER NOT NULL);
+              id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '', token_hash TEXT UNIQUE NOT NULL,
+              settings TEXT NOT NULL DEFAULT '{}', created INTEGER NOT NULL, seen INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS tenders (
               id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
               title TEXT NOT NULL DEFAULT '', number TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
@@ -90,9 +92,10 @@ def db():
               src_url TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'ok', error TEXT NOT NULL DEFAULT '',
               created INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS prices (
-              id INTEGER PRIMARY KEY, name TEXT NOT NULL, unit TEXT NOT NULL DEFAULT '', cost REAL NOT NULL DEFAULT 0,
-              note TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL, updated_by TEXT NOT NULL DEFAULT '');
-            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+              id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              name TEXT NOT NULL, unit TEXT NOT NULL DEFAULT '', cost REAL NOT NULL DEFAULT 0,
+              note TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS prices_user ON prices(user_id, name COLLATE NOCASE);
             """
         )
         _db.commit()
@@ -120,61 +123,51 @@ def now():
     return int(time.time())
 
 
-def get_settings():
-    row = q("SELECT value FROM settings WHERE key='company'", one=True)
+def get_settings(user):
     s = json.loads(json.dumps(DEFAULT_SETTINGS))
-    if row:
-        try:
-            saved = json.loads(row["value"])
-            for k, v in saved.items():
-                if isinstance(v, dict) and isinstance(s.get(k), dict):
-                    s[k].update(v)
-                else:
-                    s[k] = v
-        except ValueError:
-            pass
+    try:
+        saved = json.loads(user.get("settings") or "{}")
+    except ValueError:
+        saved = {}
+    for k, v in saved.items():
+        if isinstance(v, dict) and isinstance(s.get(k), dict):
+            s[k].update(v)
+        else:
+            s[k] = v
     return s
 
 
-# ---------------------------------------------------------------- пароли и сессии
+# ---------------------------------------------------------------- ключи рабочих мест
 
-def hash_password(pw):
-    salt = secrets.token_bytes(16)
-    dk = hashlib.scrypt(pw.encode(), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
-    return "scrypt$" + salt.hex() + "$" + dk.hex()
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
-def check_password(pw, stored):
-    try:
-        _, salt, dk = stored.split("$")
-        got = hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt), n=2 ** 14, r=8, p=1, dklen=32)
-        return hmac.compare_digest(got.hex(), dk)
-    except (ValueError, TypeError):
-        return False
+def new_token():
+    return secrets.token_urlsafe(24)
 
 
-def new_session(user_id):
-    token = secrets.token_urlsafe(32)
-    th = hashlib.sha256(token.encode()).hexdigest()
-    ex("INSERT INTO sessions(token_hash, user_id, expires) VALUES (?,?,?)", (th, user_id, now() + SESSION_DAYS * 86400))
-    ex("DELETE FROM sessions WHERE expires < ?", (now(),))
-    return token
+def user_by_token(token):
+    if not token or len(token) > 100:
+        return None
+    return q("SELECT * FROM users WHERE token_hash=?", (token_hash(token),), one=True)
 
 
 _fails = {}
 _fails_lock = threading.Lock()
 
 
-def login_blocked(ip):
+def too_many(ip, bucket, limit, window=3600):
     with _fails_lock:
-        recent = [t for t in _fails.get(ip, []) if t > time.time() - 600]
-        _fails[ip] = recent
-        return len(recent) >= 8
+        key = (bucket, ip)
+        recent = [t for t in _fails.get(key, []) if t > time.time() - window]
+        _fails[key] = recent
+        return len(recent) >= limit
 
 
-def login_failed(ip):
+def hit(ip, bucket):
     with _fails_lock:
-        _fails.setdefault(ip, []).append(time.time())
+        _fails.setdefault((bucket, ip), []).append(time.time())
 
 
 # ---------------------------------------------------------------- загрузка страниц (с защитой от обращений во внутреннюю сеть)
@@ -352,11 +345,11 @@ class ApiError(Exception):
 ROUTES = []
 
 
-def route(method, pattern, auth=True, admin=False):
+def route(method, pattern, auth=True):
     rx = re.compile("^" + pattern + "$")
 
     def deco(fn):
-        ROUTES.append((method, rx, fn, auth, admin))
+        ROUTES.append((method, rx, fn, auth))
         return fn
     return deco
 
@@ -364,6 +357,12 @@ def route(method, pattern, auth=True, admin=False):
 class Handler(BaseHTTPRequestHandler):
     server_version = "Tender/1.0"
     protocol_version = "HTTP/1.1"
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass  # клиент закрыл соединение
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
@@ -428,12 +427,10 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def current_user(self):
-        token = self.cookie_token()
-        if not token:
-            return None
-        th = hashlib.sha256(token.encode()).hexdigest()
-        return q("""SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
-                    WHERE s.token_hash=? AND s.expires>? AND u.active=1""", (th, now()), one=True)
+        u = user_by_token(self.cookie_token())
+        if u and now() - u["seen"] > 3600:
+            ex("UPDATE users SET seen=? WHERE id=?", (now(), u["id"]))
+        return u
 
     def is_https(self):
         return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
@@ -451,17 +448,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.serve_static(path)
             if method != "GET" and self.headers.get("X-Tender") != "1":
                 raise ApiError(403, "Запрос отклонён")
-            for m, rx, fn, auth, admin in ROUTES:
+            for m, rx, fn, auth in ROUTES:
                 if m != method:
                     continue
                 mt = rx.match(path)
                 if not mt:
                     continue
-                user = self.current_user() if auth or path == "/api/me" else None
+                user = self.current_user()
                 if auth and not user:
-                    raise ApiError(401, "Войдите в систему")
-                if admin and not user["is_admin"]:
-                    raise ApiError(403, "Только для администратора")
+                    raise ApiError(401, "Откройте ссылку-приглашение или свою личную ссылку")
                 return fn(self, user, *mt.groups())
             raise ApiError(404, "Не найдено")
         except ApiError as e:
@@ -502,48 +497,90 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- API: вход
 
 def public_user(u):
-    return {"id": u["id"], "login": u["login"], "name": u["name"], "isAdmin": bool(u["is_admin"])}
+    return {"id": u["id"], "name": u["name"]}
 
 
-@route("POST", r"/api/login", auth=False)
-def api_login(h, _user):
+def set_cookie(h, token):
+    return {"Set-Cookie": h.session_cookie(token, COOKIE_DAYS * 86400)}
+
+
+@route("POST", r"/api/join", auth=False)
+def api_join(h, _user):
     ip = client_ip(h)
-    if login_blocked(ip):
-        raise ApiError(429, "Слишком много попыток. Подождите 10 минут")
+    if too_many(ip, "bad", 20):
+        raise ApiError(429, "Слишком много попыток. Подождите час")
     b = h.json_body()
-    u = q("SELECT * FROM users WHERE login=? AND active=1", (str(b.get("login", "")).strip().lower(),), one=True)
-    if not u or not check_password(str(b.get("password", "")), u["pass_hash"]):
-        login_failed(ip)
-        raise ApiError(401, "Неверный логин или пароль")
-    token = new_session(u["id"])
-    h.send_json({"user": public_user(u)}, extra={"Set-Cookie": h.session_cookie(token, SESSION_DAYS * 86400)})
+    code = str(b.get("code") or "")
+    if INVITE and not hmac.compare_digest(code.encode(), INVITE.encode()):
+        hit(ip, "bad")
+        raise ApiError(403, "Ссылка-приглашение устарела. Попросите новую")
+    if too_many(ip, "join", 30, 86400):
+        raise ApiError(429, "С этого адреса создано слишком много рабочих мест. Попробуйте завтра")
+    hit(ip, "join")
+    name = re.sub(r"\s+", " ", str(b.get("name") or "")).strip()[:80]
+    token = new_token()
+    uid = ex("INSERT INTO users(name, token_hash, settings, created, seen) VALUES (?,?,?,?,?)",
+             (name, token_hash(token), "{}", now(), now()))
+    u = q("SELECT * FROM users WHERE id=?", (uid,), one=True)
+    h.send_json({"user": public_user(u), "key": token}, extra=set_cookie(h, token))
+
+
+@route("POST", r"/api/claim", auth=False)
+def api_claim(h, _user):
+    ip = client_ip(h)
+    if too_many(ip, "bad", 20):
+        raise ApiError(429, "Слишком много попыток. Подождите час")
+    token = str(h.json_body().get("key") or "")
+    u = user_by_token(token)
+    if not u:
+        hit(ip, "bad")
+        raise ApiError(404, "Личная ссылка не подошла: её сменили или скопировали не полностью")
+    h.send_json({"user": public_user(u)}, extra=set_cookie(h, token))
 
 
 @route("POST", r"/api/logout", auth=False)
 def api_logout(h, _user):
-    token = h.cookie_token()
-    if token:
-        ex("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
     h.send_json({"ok": True}, extra={"Set-Cookie": h.session_cookie("", 0)})
 
 
 @route("GET", r"/api/me", auth=False)
 def api_me(h, user):
     if not user:
-        return h.send_json({"user": None, "settings": None})
-    h.send_json({"user": public_user(user), "settings": get_settings()})
+        return h.send_json({"user": None, "invite": bool(INVITE)})
+    h.send_json({"user": public_user(user), "settings": get_settings(user), "key": h.cookie_token()})
 
 
-@route("POST", r"/api/password")
-def api_password(h, user):
+@route("POST", r"/api/relink")
+def api_relink(h, user):
+    token = new_token()
+    ex("UPDATE users SET token_hash=? WHERE id=?", (token_hash(token), user["id"]))
+    h.send_json({"key": token}, extra=set_cookie(h, token))
+
+
+@route("PUT", r"/api/profile")
+def api_profile(h, user):
     b = h.json_body()
-    if not check_password(str(b.get("old", "")), user["pass_hash"]):
-        raise ApiError(400, "Текущий пароль указан неверно")
-    new = str(b.get("new", ""))
-    if len(new) < 8:
-        raise ApiError(400, "Новый пароль: не меньше 8 символов")
-    ex("UPDATE users SET pass_hash=? WHERE id=?", (hash_password(new), user["id"]))
-    h.send_json({"ok": True})
+    if "name" in b:
+        ex("UPDATE users SET name=? WHERE id=?", (re.sub(r"\s+", " ", str(b["name"])).strip()[:80], user["id"]))
+    s = get_settings(user)
+    st = b.get("settings") if isinstance(b.get("settings"), dict) else None
+    if st:
+        tax = st.get("tax") if isinstance(st.get("tax"), dict) else {}
+        if tax.get("regime") in ("osno", "usn6", "usn15"):
+            s["tax"]["regime"] = tax["regime"]
+        for k in ("usnVat", "usnRate", "profitRate"):
+            v = num_or_none(tax.get(k))
+            if v is not None and 0 <= v <= 50:
+                s["tax"][k] = v
+        for k in ("overheadPct", "targetPct", "moneyRatePct", "bgRatePct"):
+            v = num_or_none(st.get(k))
+            if v is not None and 0 <= v <= 100:
+                s[k] = v
+        if "supplierVat" in st:
+            s["supplierVat"] = bool(st["supplierVat"])
+        ex("UPDATE users SET settings=? WHERE id=?", (json.dumps(s, ensure_ascii=False), user["id"]))
+    u = q("SELECT * FROM users WHERE id=?", (user["id"],), one=True)
+    h.send_json({"user": public_user(u), "settings": get_settings(u)})
 
 
 # ---------------------------------------------------------------- API: тендеры
@@ -704,11 +741,12 @@ def api_doc_delete(h, user, tid, did):
 
 @route("GET", r"/api/prices")
 def api_prices(h, user):
-    h.send_json({"prices": q("SELECT * FROM prices ORDER BY name COLLATE NOCASE")})
+    h.send_json({"prices": q("SELECT id, name, unit, cost, note, updated FROM prices WHERE user_id=? ORDER BY name COLLATE NOCASE",
+                             (user["id"],))})
 
 
 def price_fields(b):
-    name = str(b.get("name") or "").strip()[:240]
+    name = re.sub(r"\s+", " ", str(b.get("name") or "")).strip()[:240]
     if not name:
         raise ApiError(400, "Укажите название")
     return name, str(b.get("unit") or "")[:30], num_or_none(b.get("cost")) or 0.0, str(b.get("note") or "")[:300]
@@ -718,21 +756,22 @@ def price_fields(b):
 def api_price_add(h, user):
     b = h.json_body()
     rows = b.get("rows") if isinstance(b.get("rows"), list) else [b]
+    if q("SELECT COUNT(*) AS n FROM prices WHERE user_id=?", (user["id"],), one=True)["n"] + len(rows) > 20000:
+        raise ApiError(400, "В прайсе слишком много строк")
     added = 0
-    for r in rows[:2000]:
+    for r in rows[:5000]:
         if not isinstance(r, dict):
             continue
         try:
             name, unit, cost, note = price_fields(r)
         except ApiError:
             continue
-        exist = q("SELECT id FROM prices WHERE lower(name)=lower(?)", (name,), one=True)
+        exist = q("SELECT id FROM prices WHERE user_id=? AND name=? COLLATE NOCASE", (user["id"], name), one=True)
         if exist:
-            ex("UPDATE prices SET unit=?, cost=?, note=?, updated=?, updated_by=? WHERE id=?",
-               (unit, cost, note, now(), user["login"], exist["id"]))
+            ex("UPDATE prices SET unit=?, cost=?, note=?, updated=? WHERE id=?", (unit, cost, note, now(), exist["id"]))
         else:
-            ex("INSERT INTO prices(name, unit, cost, note, updated, updated_by) VALUES (?,?,?,?,?,?)",
-               (name, unit, cost, note, now(), user["login"]))
+            ex("INSERT INTO prices(user_id, name, unit, cost, note, updated) VALUES (?,?,?,?,?,?)",
+               (user["id"], name, unit, cost, note, now()))
         added += 1
     h.send_json({"ok": True, "count": added})
 
@@ -740,131 +779,44 @@ def api_price_add(h, user):
 @route("PUT", r"/api/prices/(\d+)")
 def api_price_put(h, user, pid):
     name, unit, cost, note = price_fields(h.json_body())
-    ex("UPDATE prices SET name=?, unit=?, cost=?, note=?, updated=?, updated_by=? WHERE id=?",
-       (name, unit, cost, note, now(), user["login"], int(pid)))
+    ex("UPDATE prices SET name=?, unit=?, cost=?, note=?, updated=? WHERE id=? AND user_id=?",
+       (name, unit, cost, note, now(), int(pid), user["id"]))
     h.send_json({"ok": True})
 
 
 @route("DELETE", r"/api/prices/(\d+)")
 def api_price_delete(h, user, pid):
-    ex("DELETE FROM prices WHERE id=?", (int(pid),))
+    ex("DELETE FROM prices WHERE id=? AND user_id=?", (int(pid), user["id"]))
     h.send_json({"ok": True})
-
-
-# ---------------------------------------------------------------- API: пользователи и настройки (админ)
-
-@route("GET", r"/api/users", admin=True)
-def api_users(h, user):
-    rows = q("""SELECT u.id, u.login, u.name, u.is_admin, u.active, u.created,
-                (SELECT COUNT(*) FROM tenders t WHERE t.user_id=u.id) AS tenders FROM users u ORDER BY u.id""")
-    h.send_json({"users": rows})
-
-
-def valid_login(s):
-    s = str(s or "").strip().lower()
-    if not re.fullmatch(r"[a-z0-9._@-]{3,40}", s):
-        raise ApiError(400, "Логин: 3–40 латинских букв, цифр или . _ - @")
-    return s
-
-
-@route("POST", r"/api/users", admin=True)
-def api_user_add(h, user):
-    b = h.json_body()
-    login = valid_login(b.get("login"))
-    pw = str(b.get("password") or "")
-    if len(pw) < 8:
-        raise ApiError(400, "Пароль: не меньше 8 символов")
-    if q("SELECT id FROM users WHERE login=?", (login,), one=True):
-        raise ApiError(400, "Такой логин уже есть")
-    uid = ex("INSERT INTO users(login, name, pass_hash, is_admin, active, created) VALUES (?,?,?,?,1,?)",
-             (login, str(b.get("name") or "")[:100], hash_password(pw), 1 if b.get("isAdmin") else 0, now()))
-    h.send_json({"id": uid})
-
-
-@route("PUT", r"/api/users/(\d+)", admin=True)
-def api_user_put(h, user, uid):
-    uid = int(uid)
-    b = h.json_body()
-    target = q("SELECT * FROM users WHERE id=?", (uid,), one=True)
-    if not target:
-        raise ApiError(404, "Пользователь не найден")
-    if "name" in b:
-        ex("UPDATE users SET name=? WHERE id=?", (str(b["name"])[:100], uid))
-    if "password" in b:
-        pw = str(b["password"])
-        if len(pw) < 8:
-            raise ApiError(400, "Пароль: не меньше 8 символов")
-        ex("UPDATE users SET pass_hash=? WHERE id=?", (hash_password(pw), uid))
-        ex("DELETE FROM sessions WHERE user_id=?", (uid,))
-    if "active" in b or "isAdmin" in b:
-        if uid == user["id"]:
-            raise ApiError(400, "Нельзя отключить себя или снять с себя права администратора")
-        if "active" in b:
-            ex("UPDATE users SET active=? WHERE id=?", (1 if b["active"] else 0, uid))
-            if not b["active"]:
-                ex("DELETE FROM sessions WHERE user_id=?", (uid,))
-        if "isAdmin" in b:
-            ex("UPDATE users SET is_admin=? WHERE id=?", (1 if b["isAdmin"] else 0, uid))
-    h.send_json({"ok": True})
-
-
-@route("PUT", r"/api/settings", admin=True)
-def api_settings_put(h, user):
-    b = h.json_body()
-    s = get_settings()
-    tax = b.get("tax") if isinstance(b.get("tax"), dict) else {}
-    if tax.get("regime") in ("osno", "usn6", "usn15"):
-        s["tax"]["regime"] = tax["regime"]
-    for k in ("usnVat", "usnRate", "profitRate"):
-        v = num_or_none(tax.get(k))
-        if v is not None and 0 <= v <= 50:
-            s["tax"][k] = v
-    for k in ("overheadPct", "targetPct", "moneyRatePct", "bgRatePct"):
-        v = num_or_none(b.get(k))
-        if v is not None and 0 <= v <= 100:
-            s[k] = v
-    if "supplierVat" in b:
-        s["supplierVat"] = bool(b["supplierVat"])
-    if "company" in b:
-        s["company"] = str(b["company"])[:200]
-    ex("INSERT INTO settings(key, value) VALUES ('company', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-       (json.dumps(s, ensure_ascii=False),))
-    h.send_json({"settings": s})
 
 
 # ---------------------------------------------------------------- запуск
 
-def create_admin(login):
-    login = valid_login(login)
-    pw = os.environ.get("TENDER_ADMIN_PASSWORD") or getpass.getpass("Пароль администратора (не меньше 8 символов): ")
-    if len(pw) < 8:
-        print("Пароль слишком короткий", file=sys.stderr)
-        sys.exit(1)
-    exist = q("SELECT id FROM users WHERE login=?", (login,), one=True)
-    if exist:
-        ex("UPDATE users SET pass_hash=?, is_admin=1, active=1 WHERE id=?", (hash_password(pw), exist["id"]))
-        print(f"Пароль пользователя {login} обновлён, права администратора выданы")
-    else:
-        ex("INSERT INTO users(login, name, pass_hash, is_admin, active, created) VALUES (?,?,?,1,1,?)",
-           (login, "Администратор", hash_password(pw), now()))
-        print(f"Администратор {login} создан")
-
-
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
-    if cmd == "create-admin":
-        if len(sys.argv) < 3:
-            print("Использование: server.py create-admin <логин>", file=sys.stderr)
-            sys.exit(2)
-        create_admin(sys.argv[2])
+    if cmd == "users":
+        rows = q("""SELECT u.id, u.name, u.created, u.seen, (SELECT COUNT(*) FROM tenders t WHERE t.user_id=u.id) AS n
+                    FROM users u ORDER BY u.id""")
+        if not rows:
+            print("Рабочих мест пока нет")
+        for r in rows:
+            print(f"{r['id']:>4}  {r['name'] or 'без имени':<30} тендеров: {r['n']:<4} был: {time.strftime('%d.%m.%Y', time.localtime(r['seen']))}")
         return
-    if cmd == "count-users":
-        print(q("SELECT COUNT(*) AS n FROM users", one=True)["n"])
+    if cmd == "relink":
+        if len(sys.argv) < 3 or not sys.argv[2].isdigit():
+            print("Использование: server.py relink <id>", file=sys.stderr)
+            sys.exit(2)
+        token = new_token()
+        if not q("SELECT id FROM users WHERE id=?", (int(sys.argv[2]),), one=True):
+            print("Нет рабочего места с таким номером", file=sys.stderr)
+            sys.exit(1)
+        ex("UPDATE users SET token_hash=? WHERE id=?", (token_hash(token), int(sys.argv[2])))
+        print(token)
         return
     db()
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
-    print(f"Тендерный калькулятор: http://{HOST}:{PORT}", flush=True)
+    print(f"Тендерный калькулятор: http://{HOST}:{PORT}" + ("" if INVITE else "  (приглашение не задано: войти может любой)"), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
