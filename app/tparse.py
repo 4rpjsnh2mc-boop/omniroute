@@ -155,7 +155,8 @@ def parse_html(text):
 
 # ---------------------------------------------------------------- числа
 
-MONEY_RE = re.compile(r"(\d{1,3}(?:[\s  ]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)")
+# первая группа до 6 цифр: на скриншотах пробел после миллионов часто теряется («1284 600,00»)
+MONEY_RE = re.compile(r"(\d{1,6}(?:[\s  ]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)")
 PCT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*%")
 
 
@@ -204,6 +205,7 @@ FIELDS = {
         r"^организаци\w*,? осуществляющ\w* размещение",
         r"^название организации",
         r"^организатор\w*( торгов| закупки| конкурса| запроса)?\s*:?$",
+        r"^организатор\w*( торгов| закупки| конкурса| запроса)?\s*(\||:)",
     ],
     "deadline": [
         r"дата и время окончания (срока )?подачи заявок",
@@ -597,7 +599,7 @@ def flags(text):
     return out
 
 
-INN_RE = re.compile(r"ИНН[\s:№]*?(\d{10}|\d{12})\b")
+INN_RE = re.compile(r"ИНН[\s:№|]*?(\d{10}|\d{12})\b")
 
 
 def find_inn(*texts):
@@ -753,3 +755,77 @@ def normalize_url(url):
     if host.endswith("bidzaar.com") and u.path.startswith("/process/"):
         return urllib.parse.urlunsplit(u._replace(path="/app" + u.path))
     return url
+
+
+# ---------------------------------------------------------------- текст со скриншотов, PDF и буфера обмена
+
+CELL_SPLIT_RE = re.compile(r"\t|\s*\|\s*|\s{2,}")
+HEAD_NAME_RE = re.compile(r"^(наименован|товар|позици|описани|предмет)", re.I)
+HEAD_QTY_RE = re.compile(r"^(кол-?во|количеств|объ[её]м)", re.I)
+
+
+def _cells(line):
+    return [c.strip() for c in CELL_SPLIT_RE.split(line.strip(" |")) if c.strip()]
+
+
+def _align(row, header, name_i):
+    """Распознанная строка таблицы часто теряет или склеивает ячейки. Столбцы справа от названия
+    (кол-во, цена, сумма) выравниваем по правому краю, всё лишнее склеиваем в название."""
+    if len(row) == len(header):
+        return row
+    right = len(header) - name_i - 1
+    if len(row) < right + 1:
+        return row
+    tail = row[len(row) - right:] if right else []
+    head = row[:len(row) - right] if right else row[:]
+    left = head[:name_i]
+    if len(left) < name_i:  # «1 Цемент …» — номер склеился с названием
+        m = re.match(r"^(\d{1,4})[.)]?\s+(.+)$", head[0]) if head else None
+        if m and name_i == 1:
+            left, head = [m.group(1)], [m.group(2)] + head[1:]
+        else:
+            left = left + [""] * (name_i - len(left))
+    name = " ".join(head[len(left):]) if len(head) > len(left) else ""
+    return left + [name] + tail
+
+
+def text_to_html(text):
+    """Текст (распознанный скриншот, PDF, копия страницы) → простой HTML: строки со столбцами
+    становятся таблицами, остальное абзацами. Дальше его разбирает обычный extract()."""
+    out, table, header, name_i = [], None, None, None
+    lines = [l.rstrip() for l in str(text or "").replace("\r", "").split("\n")]
+
+    def close():
+        nonlocal table, header, name_i
+        if table:
+            out.append("<table>" + "".join("<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in r) + "</tr>" for r in table) + "</table>")
+        table, header, name_i = None, None, None
+
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        cells = _cells(line)
+        if len(cells) >= 2:
+            low = [c.lower() for c in cells]
+            is_head = any(HEAD_NAME_RE.search(c) for c in low) and any(HEAD_QTY_RE.search(c) for c in low)
+            if is_head:
+                close()
+                table, header = [cells], cells
+                name_i = next(k for k, c in enumerate(low) if HEAD_NAME_RE.search(c))
+                continue
+            if table is None:
+                table = []
+            table.append(_align(cells, header, name_i) if header else cells)
+            continue
+        nxt = next((l for l in lines[i + 1:] if l.strip()), "")
+        if header and table and len(table) > 1 and len(line) < 150 and (line.strip()[:1].islower() or len(_cells(nxt)) >= 3):
+            # перенос длинного названия на новую строку внутри таблицы
+            last = table[-1]
+            last[name_i] = (last[name_i] + " " + line.strip()).strip()
+            continue
+        if header and table and len(table) == 1 and len(line) < 150:
+            continue  # перенос в шапке таблицы
+        close()
+        out.append(f"<p>{html.escape(line.strip())}</p>")
+    close()
+    return "<html><body>" + "\n".join(out) + "</body></html>"

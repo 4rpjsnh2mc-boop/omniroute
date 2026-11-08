@@ -255,9 +255,17 @@ def _ocr(path):
     return run(["tesseract", path, "-", "-l", "rus+eng", "--psm", "6", "-c", "preserve_interword_spaces=1"], timeout=120)
 
 
-def image_text(data):
-    """Текст с картинки. Если есть ImageMagick: увеличиваем мелкие скриншоты и стираем линии таблицы,
-    распознаём оба варианта и берём тот, где нашлось больше позиций прайса."""
+def image_text(data, score=None):
+    """Текст с картинки: лучший из вариантов распознавания (по умолчанию тот, где больше позиций прайса)."""
+    texts = image_texts(data)
+    if texts is None:
+        return None
+    return max(texts, key=score or (lambda t: len(lines_to_items(t))))
+
+
+def image_texts(data):
+    """Варианты текста с картинки. Если есть ImageMagick: увеличиваем мелкий текст и распознаём
+    как есть (лучше для серого текста) и со стёртыми линиями таблицы (лучше для таблиц)."""
     if not shutil.which("tesseract"):
         return None
     with tempfile.TemporaryDirectory() as d:
@@ -267,8 +275,14 @@ def image_text(data):
         texts = []
         conv = shutil.which("convert") or shutil.which("magick")
         if conv:
-            w = run([shutil.which("identify") or conv, "-format", "%w", src + "[0]"], timeout=30) if shutil.which("identify") else ""
-            scale = "300%" if (w.strip().isdigit() and int(w) < 1400) else "150%"
+            size = run([shutil.which("identify"), "-format", "%w %h", src + "[0]"], timeout=30).split() if shutil.which("identify") else []
+            if len(size) == 2 and size[0].isdigit() and size[1].isdigit():
+                w, hgt = int(size[0]), int(size[1])
+                # мелкий текст увеличиваем до ~2400 px по ширине, но не больше 3 раз и не больше 30 Мп
+                k = min(3.0, max(1.0, 2400 / max(w, 1)), (30e6 / max(w * hgt, 1)) ** 0.5)
+                scale = f"{max(k, 0.3) * 100:.0f}%"
+            else:
+                scale = "150%"
             base = [conv, src + "[0]", "-colorspace", "Gray", "-resize", scale]
             try:
                 subprocess.run(base + ["-threshold", "60%", "-negate",
@@ -278,14 +292,29 @@ def image_text(data):
                 subprocess.run(base + ["-sharpen", "0x1", d + "/plain.png"], capture_output=True, timeout=60)
             except subprocess.TimeoutExpired:
                 pass
-            for v in ("nolines.png", "plain.png"):
+            for v in ("plain.png", "nolines.png"):
                 try:
-                    texts.append(_ocr(d + "/" + v))
+                    texts.append(ocr_fix(_ocr(d + "/" + v)))
                 except (subprocess.TimeoutExpired, OSError):
                     continue
         if not any(texts):
-            texts.append(_ocr(src))
-        return max(texts, key=lambda t: len(lines_to_items(t)))
+            texts = [ocr_fix(_ocr(src))]
+        return texts
+
+
+LATIN_TO_CYR = str.maketrans("ABCEHKMOPTXaceopxy", "АВСЕНКМОРТХасеорху")
+
+
+def ocr_fix(text):
+    """Частые ошибки распознавания: латинские буквы внутри русских слов, «UHH» вместо «ИНН»."""
+    text = re.sub(r"\b[UИN][HН][HН]\b", "ИНН", text or "")
+
+    def word(m):
+        w = m.group(0)
+        if re.search(r"[А-Яа-яЁё]", w) and re.search(r"[A-Za-z]", w):
+            return w.translate(LATIN_TO_CYR)
+        return w
+    return re.sub(r"[A-Za-zА-Яа-яЁё]+", word, text)
 
 
 def kind_of(name, data):
@@ -410,3 +439,175 @@ def is_yandex_disk(url):
 
 
 YANDEX_API = "https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key="
+
+
+# ---------------------------------------------------------------- закупка со скриншотов, фото, PDF и Word
+
+QTY_HEAD_RE = re.compile(r"кол-?\s?во|количеств|объ[её]м", re.I)
+PRICE_HEAD_RE = re.compile(r"цена", re.I)
+SUM_HEAD_RE = re.compile(r"сумм|стоимост", re.I)
+ROW_TAIL_NUM_RE = re.compile(r"(?:^|\s)(\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d{1,3})?|\d+(?:[.,]\d{1,3})?)\s*$")
+WORDS_SCORE = lambda t: len(re.findall(r"[А-Яа-яЁё]{3,}", t or ""))
+
+
+def _strip_tail_numbers(s, limit):
+    nums = []
+    s = CURRENCY_RE.sub(" ", s).rstrip(" .|")
+    while len(nums) < limit:
+        m = ROW_TAIL_NUM_RE.search(s)
+        if not m:
+            break
+        nums.insert(0, to_price(m.group(1)))
+        s = s[:m.start()].rstrip(" |")
+    return s, nums
+
+
+def items_from_text(text):
+    """Таблица позиций из распознанного текста: «1 Цемент М500, мешок 50 кг  шт  400  560,00».
+    Столбцы на скриншоте часто склеиваются, поэтому числа берём справа налево по порядку шапки."""
+    lines = [l for l in str(text or "").replace("\r", "").split("\n")]
+    out, order, misses, last, pending = [], None, 0, None, ""
+    for line in lines:
+        low = line.lower()
+        if order is None or (re.search(r"наименован|товар|позици", low) and QTY_HEAD_RE.search(low)):
+            if re.search(r"наименован|товар|позици|предмет", low) and QTY_HEAD_RE.search(low):
+                cols = [(QTY_HEAD_RE.search(low), "qty"), (PRICE_HEAD_RE.search(low), "price"), (SUM_HEAD_RE.search(low), "sum")]
+                order = [k for m, k in sorted((c for c in cols if c[0]), key=lambda c: c[0].start())]
+                misses, last = 0, None
+            continue
+        st = line.strip()
+        if not st:
+            continue
+        if re.match(r"^(итого|всего)", low.strip()):
+            order = None
+            continue
+        head, nums = _strip_tail_numbers(st, len(order))
+        if not nums:
+            if last is not None and st[:1].islower() and len(st) < 150:
+                last["name"] = (last["name"] + " " + st).strip()[:240]
+                continue
+            pending = st if len(st) < 150 else ""  # начало длинного названия на строке выше
+            misses += 1
+            if misses >= 3:
+                order = None
+            continue
+        head = re.sub(r"^\s*\d{1,4}[.)]?\s+", "", head)
+        unit = ""
+        parts = head.rsplit(None, 1)
+        if len(parts) == 2:
+            cand = parts[1].translate(LATIN_LOOKALIKE) if len(parts[1]) <= 4 else parts[1]
+            if UNIT_RE.match(cand):
+                unit, head = cand, parts[0]
+        name = P.clean_name(head.strip(" |,;"))
+        if pending and name[:1].islower():
+            name = P.clean_name(pending + " " + name)
+        pending = ""
+        vals = dict(zip(order, nums))
+        qty = vals.get("qty")
+        if len(re.findall(r"[A-Za-zА-Яа-яЁё]", name)) < 3 or not qty or qty <= 0:
+            misses += 1
+            if misses >= 3:
+                order = None
+            continue
+        misses = 0
+        price = vals.get("price")
+        if not price and vals.get("sum") and qty:
+            price = round(vals["sum"] / qty, 2)
+        last = {"name": name[:240], "unit": unit_norm(unit), "qty": qty, "nmckUnit": price}
+        out.append(last)
+    return out
+
+
+SUBJECT_START_RE = re.compile(r"^(поставка|выполнение|оказание|закупка|приобретение|капитальный ремонт|ремонт|строительство|"
+                              r"монтаж|устройство|благоустройство|изготовление|право заключения)\b", re.I)
+
+
+def _table_html(rows):
+    return "<table>" + "".join("<tr>" + "".join(f"<td>{html.escape(str(c))}</td>" for c in r) + "</tr>" for r in rows) + "</table>"
+
+
+def docx_html(data):
+    """Word → HTML в порядке документа (каждая таблица отдельно) и строки таблиц текстом."""
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        root = ET.fromstring(z.read("word/document.xml"))
+    body = root.find(w + "body")
+    parts, rows_text = [], []
+    for el in (body if body is not None else []):
+        if el.tag == w + "tbl":
+            rows = [[re.sub(r"\s+", " ", "".join(t.text or "" for t in tc.iter(w + "t"))).strip() for tc in tr.findall(w + "tc")]
+                    for tr in el.iter(w + "tr")]
+            parts.append(_table_html(rows))
+            rows_text += ["\t".join(r) for r in rows]
+        elif el.tag == w + "p":
+            line = "".join(t.text or "" for t in el.iter(w + "t")).strip()
+            if line:
+                parts.append(f"<p>{html.escape(line)}</p>")
+    return "<html><body>" + "".join(parts) + "</body></html>", "\n".join(rows_text)
+
+
+def page_of(name, data):
+    """Файл закупки → {html, text, rows, warnings}. text — распознанный или простой текст,
+    rows — строки таблиц для поиска позиций. Картинки и сканы распознаются."""
+    kind = kind_of(name, data)
+    out = {"html": "", "text": "", "rows": "", "warnings": []}
+    if kind == "image":
+        texts = image_texts(data)
+        if texts is None:
+            out["warnings"].append("На сервере нет программы распознавания текста. Запустите установку ещё раз")
+            return out
+        out["text"] = max(texts, key=WORDS_SCORE)  # поля закупки
+        best = max(texts, key=lambda t: len(items_from_text(t)))  # таблица позиций
+        if best != out["text"]:
+            out["rows"] = best
+        out["alt"] = [t for t in texts if t != out["text"]]  # пустые поля добираем из других вариантов
+    elif kind == "pdf":
+        t = pdf_text(data)
+        if t is None:
+            out["warnings"].append("На сервере нет программы для чтения PDF. Запустите установку ещё раз")
+        elif len(t.strip()) < 50:
+            t = pdf_ocr(data)
+            out["warnings"].append("PDF оказался сканом: текст распознан, проверьте данные" if t.strip() else "Не получилось прочитать PDF")
+        out["text"] = t or ""
+    elif kind == "docx":
+        out["html"], out["rows"] = docx_html(data)
+    elif kind == "xlsx":
+        rows = xlsx_rows(data)
+        out["html"], out["rows"] = "<html><body>" + _table_html(rows) + "</body></html>", "\n".join("\t".join(map(str, r)) for r in rows)
+    elif kind == "html":
+        out["html"] = decode_text(data)
+    elif kind == "text":
+        out["text"] = decode_text(data)
+    elif kind == "ole":
+        out["warnings"].append("Старый формат .doc или .xls: сохраните файл как .docx или .xlsx")
+    else:
+        out["warnings"].append("Этот файл не получилось прочитать")
+    return out
+
+
+def tender_from_parts(parts):
+    """Поля закупки и позиции из нескольких файлов, скриншотов и вставленного текста."""
+    pages = [("", p["html"]) for p in parts if p.get("html")]
+    pages += [("", P.text_to_html(p["text"])) for p in parts if (p.get("text") or "").strip()]
+    info = P.extract(pages or [("", "<html></html>")], "")
+    text = "\n".join(p.get("text") or "" for p in parts)
+    by_rows = items_from_text("\n".join(p.get("rows") or p.get("text") or "" for p in parts))
+    if len(by_rows) > len(info["items"]):
+        info["items"] = by_rows[:300]
+    alts = [t for p in parts for t in p.get("alt") or [] if t.strip()]
+    if alts:
+        extra = P.extract([("", P.text_to_html(t)) for t in alts], "")
+        for k in ("number", "subject", "customer", "inn", "deadline", "place", "contractTerm", "nmck", "appSecPct", "conSecPct", "advancePct"):
+            if info.get(k) in (None, "") and extra.get(k) not in (None, ""):
+                info[k] = extra[k]
+        for k, v in extra["flags"].items():
+            info["flags"].setdefault(k, v)
+    if not info["subject"]:
+        for line in text.split("\n")[:40]:
+            st = re.sub(r"\s+", " ", line).strip(" |")
+            if SUBJECT_START_RE.match(st) and len(st) > 15:
+                info["subject"] = st[:300]
+                break
+    if not info["inn"]:
+        info["inn"] = P.find_inn(text)
+    return info

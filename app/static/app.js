@@ -284,9 +284,10 @@ async function viewList() {
       <form class="row" id="new-f">
         <div class="inp grow"><input id="new-url" type="url" inputmode="url" placeholder="Вставьте ссылку на закупку: zakupki.gov.ru, Росэлторг, B2B-Center…" aria-label="Ссылка на закупку"></div>
         <button class="btn primary" type="submit">Загрузить тендер</button>
+        <label class="btn" for="new-shots" style="position:relative;overflow:hidden">Из скриншотов<input type="file" id="new-shots" multiple accept="${SHOT_ACCEPT}" style="position:absolute;inset:0;opacity:0;cursor:pointer"></label>
         <button class="btn" type="button" id="new-empty">Пустой расчёт</button>
       </form>
-      <p class="hint" style="margin-top:8px">Сервер откроет страницу закупки, заполнит позиции и условия и скачает документы.</p>
+      <p class="hint" style="margin-top:8px">Сервер откроет страницу закупки, заполнит позиции и условия и скачает документы. Если площадка не пускает без входа, загрузите скриншоты, фото или документы закупки, или просто нажмите <b>Ctrl+V</b> со скриншотом на этой странице.</p>
     </div>
     <div id="soon"></div>
     <div class="stats" id="stats"></div>
@@ -294,11 +295,14 @@ async function viewList() {
     <div class="card" style="padding:0"><div class="table-wrap" style="border:0">
       <table class="list" style="min-width:900px"><thead><tr><th>Тендер</th><th>Подача до</th><th class="r">Закупка</th><th class="r">Наша цена</th><th class="r">Маржа</th><th>Следующий шаг</th><th>Статус</th></tr></thead><tbody id="t-body"><tr><td colspan="7" class="muted">Загрузка…</td></tr></tbody></table>
     </div></div>`;
-  const create = async (url) => {
+  const create = async (url, files) => {
     const r = await api("POST", "/api/tenders", { title: url ? "Загрузка…" : "Новый тендер", data: newData() });
     if (url) pendingImport = { id: r.id, url };
+    if (files) pendingImport = { id: r.id, files };
     location.hash = "#/t/" + r.id;
   };
+  viewList.create = create;
+  $("#new-shots").addEventListener("change", (e) => { const fs = [...e.target.files]; e.target.value = ""; if (fs.length) create("", fs).catch((ex) => toast(ex.message)); });
   $("#new-f").addEventListener("submit", async (e) => {
     e.preventDefault();
     const url = $("#new-url").value.trim();
@@ -481,6 +485,18 @@ async function viewTender(id) {
           <button class="btn primary" type="submit" id="imp-btn">${d.meta.url ? "Обновить с площадки" : "Загрузить с площадки"}</button>
           ${d.meta.url ? `<a class="btn" href="${esc(d.meta.url)}" target="_blank" rel="noopener">Открыть</a>` : ""}
         </form>
+        <div class="shots">
+          <div class="row">
+            <label class="btn" for="shot-file" style="position:relative;overflow:hidden">Скриншоты или файлы закупки<input type="file" id="shot-file" multiple accept="${SHOT_ACCEPT}" style="position:absolute;inset:0;opacity:0;cursor:pointer"></label>
+            <button class="btn" type="button" id="shot-text-t" aria-expanded="false">Вставить текст</button>
+          </div>
+          <p class="hint" style="margin-top:6px">Площадка не пускает без входа? Загрузите скриншоты или фото страницы закупки, ТЗ в PDF или Word. Скриншот можно не сохранять: скопируйте и нажмите <b>Ctrl+V</b> на этой странице. Файлы сохранятся в документах тендера.</p>
+          <div id="shot-text" hidden style="margin-top:8px">
+            <textarea id="shot-ta" rows="5" placeholder="Откройте закупку на площадке, выделите всё (Ctrl+A), скопируйте (Ctrl+C) и вставьте сюда"></textarea>
+            <div class="row" style="margin-top:6px"><button class="btn primary" type="button" id="shot-text-go">Разобрать текст</button></div>
+          </div>
+          <p class="small muted" id="shot-st" role="status" style="margin-top:6px"></p>
+        </div>
         <div class="fields">
           ${F("meta.subject", "Предмет закупки", { wide: true })}
           ${F("nmck", "НМЦК", { num: true, u: "₽ с НДС", h: "Начальная цена из извещения" })}
@@ -594,6 +610,9 @@ async function viewTender(id) {
   };
 
   $("#imp-f").addEventListener("submit", (e) => { e.preventDefault(); runImport($("#f-meta-url").value.trim()); });
+  $("#shot-file").addEventListener("change", (e) => { const fs = [...e.target.files]; e.target.value = ""; readShots(fs); });
+  $("#shot-text-t").onclick = () => { const box = $("#shot-text"); box.hidden = !box.hidden; $("#shot-text-t").setAttribute("aria-expanded", String(!box.hidden)); if (!box.hidden) $("#shot-ta").focus(); };
+  $("#shot-text-go").onclick = () => { const t = $("#shot-ta").value; if (t.trim().length < 20) return toast("Вставьте текст страницы закупки"); readPastedText(t, ""); };
   $("#t-del").addEventListener("click", (e) => confirmInline(e.currentTarget, "Удалить тендер?", async () => {
     await api("DELETE", "/api/tenders/" + T.id); T.dirty = false; location.hash = "#/";
   }));
@@ -604,7 +623,11 @@ async function viewTender(id) {
   });
   $("#up-file").addEventListener("change", uploadDocs);
 
-  if (pendingImport && pendingImport.id === id) { const u = pendingImport.url; pendingImport = null; $("#f-meta-url").value = u; d.meta.url = u; runImport(u); }
+  if (pendingImport && pendingImport.id === id) {
+    const pi = pendingImport; pendingImport = null;
+    if (pi.files) readShots(pi.files);
+    else { $("#f-meta-url").value = pi.url; d.meta.url = pi.url; runImport(pi.url); }
+  }
 }
 function confirmInline(btn, question, fn) {
   const box = document.createElement("span");
@@ -937,29 +960,8 @@ async function runImport(url) {
   btn.disabled = true; st.textContent = "Открываю страницу закупки…";
   try {
     const { info } = await api("POST", `/api/tenders/${T.id}/import`, { url });
-    const d = T.data;
-    d.meta.url = url;
-    for (const k of ["number", "customer", "subject", "deadline", "place", "contractTerm"]) if (info[k]) d.meta[k] = info[k];
-    if (info.law) d.meta.law = info.law;
-    if (info.nmck) d.nmck = info.nmck;
-    if (info.appSecPct !== null && info.appSecPct !== undefined) d.adv.appSecPct = info.appSecPct;
-    if (info.conSecPct !== null && info.conSecPct !== undefined) d.adv.conSecPct = info.conSecPct;
-    if (info.advancePct !== null && info.advancePct !== undefined) d.adv.advancePct = info.advancePct;
-    const days = parseDays(info.contractTerm);
-    if (days) d.adv.contractDays = days;
-    if (d.meta.law !== "44") d.adv.platformFee = d.adv.platformFee || 0;
-    if (info.items && info.items.length) {
-      d.items = info.items.map((x) => {
-        const p = priceIndex.get(x.name.trim().toLowerCase());
-        return { id: uid(), name: x.name, unit: x.unit || (p && p.unit) || "", qty: x.qty, nmckUnit: x.nmckUnit || 0, cost: p && p.cost > 0 ? p.cost : 0 };
-      });
-    }
-    d.missingDocs = info.missingDocs || [];
-    d.flags = info.flags || {};
-    d.inn = info.inn || d.inn || "";
-    if (info.deadline) { d.meta.deadlineAt = parseDeadline(info.deadline) || d.meta.deadlineAt; }
-    d.bid = { mode: "target" };
-    fillFields(); renderItems(); recalc(); renderStages(); renderLawTip(); changed(); await saveNow();
+    T.data.meta.url = url;
+    await applyInfo(info, false);
     $("#imp-btn").textContent = "Обновить с площадки";
     const found = info.items ? info.items.length : 0;
     st.textContent = `Загружено: ${found} ${plural(found, "позиция", "позиции", "позиций")}, документов найдено: ${info.docs.length}`;
@@ -970,6 +972,116 @@ async function runImport(url) {
     toast(e.message);
   } finally { btn.disabled = false; }
 }
+
+// Заполняет тендер найденными данными. fromFiles: данные со скриншотов и файлов — позиции добавляются
+// к уже имеющимся (скриншоты часто присылают по частям), отметки из документов не стираются.
+async function applyInfo(info, fromFiles) {
+  const d = T.data;
+  let filled = 0;
+  for (const k of ["number", "customer", "subject", "deadline", "place", "contractTerm"]) if (info[k]) { d.meta[k] = info[k]; filled++; }
+  if (info.law) d.meta.law = info.law;
+  if (info.nmck) { d.nmck = info.nmck; filled++; }
+  if (info.appSecPct !== null && info.appSecPct !== undefined) d.adv.appSecPct = info.appSecPct;
+  if (info.conSecPct !== null && info.conSecPct !== undefined) d.adv.conSecPct = info.conSecPct;
+  if (info.advancePct !== null && info.advancePct !== undefined) d.adv.advancePct = info.advancePct;
+  const days = parseDays(info.contractTerm);
+  if (days) d.adv.contractDays = days;
+  if (d.meta.law !== "44") d.adv.platformFee = d.adv.platformFee || 0;
+  let added = 0;
+  if (info.items && info.items.length) {
+    const old = new Map(d.items.filter((x) => x.name.trim()).map((x) => [x.name.trim().toLowerCase(), x]));
+    const next = info.items.map((x) => {
+      const k = x.name.trim().toLowerCase(), was = old.get(k), p = priceIndex.get(k);
+      old.delete(k);
+      if (was) return { ...was, unit: x.unit || was.unit, qty: x.qty || was.qty, nmckUnit: x.nmckUnit || was.nmckUnit };
+      added++;
+      return { id: uid(), name: x.name, unit: x.unit || (p && p.unit) || "", qty: x.qty, nmckUnit: x.nmckUnit || 0, cost: p && p.cost > 0 ? p.cost : 0 };
+    });
+    d.items = fromFiles ? [...d.items.filter((x) => x.name.trim() && old.has(x.name.trim().toLowerCase())), ...next] : next;
+  }
+  if (fromFiles) {
+    d.flags = { ...(d.flags || {}), ...(info.flags || {}) };
+  } else {
+    d.missingDocs = info.missingDocs || [];
+    d.flags = info.flags || {};
+  }
+  d.inn = info.inn || d.inn || "";
+  if (info.deadline) { d.meta.deadlineAt = parseDeadline(info.deadline) || d.meta.deadlineAt; }
+  d.bid = { mode: "target" };
+  fillFields(); renderItems(); recalc(); renderStages(); renderLawTip(); changed(); await saveNow();
+  return { filled, added, items: info.items ? info.items.length : 0 };
+}
+
+/* закупка со скриншотов, фото, документов и скопированного текста — когда площадка не пускает без входа */
+const SHOT_ACCEPT = "image/*,.pdf,.docx,.xlsx,.txt,.csv,.htm,.html";
+let shotBusy = false;
+async function readShots(files) {
+  files = files.filter(Boolean);
+  if (!files.length || !T) return;
+  if (shotBusy) return toast("Подождите, предыдущие файлы ещё читаются");
+  const id = T.id, st = $("#shot-st"), ids = [], warns = new Set();
+  shotBusy = true;
+  const set = (t) => { if (T && T.id === id && $("#shot-st")) $("#shot-st").textContent = t; };
+  try {
+    for (const [i, f] of files.entries()) {
+      if (f.size > 25 * 1024 * 1024) { toast(`${f.name}: файл больше 25 МБ`); continue; }
+      const pic = /^image\//.test(f.type) || /\.(png|jpe?g|webp|heic|bmp|gif|tiff?)$/i.test(f.name);
+      set(`Читаю ${files.length > 1 ? `${i + 1} из ${files.length}: ` : ""}${f.name}…${pic ? " Распознавание картинки занимает до минуты." : ""}`);
+      try {
+        const r = await api("POST", `/api/tenders/${id}/read`, f, { "X-File-Name": encodeURIComponent(f.name), "Content-Type": "application/octet-stream" });
+        ids.push(r.id);
+        (r.warnings || []).forEach((w) => warns.add(w));
+        if (!r.chars) warns.add(`${f.name}: текст не найден`);
+      } catch (ex) { toast(`${f.name}: ${ex.message}`); }
+    }
+    if (!ids.length) { set(""); return; }
+    set("Разбираю закупку…");
+    const { info } = await api("POST", `/api/tenders/${id}/import`, { docIds: ids });
+    if (!T || T.id !== id) return;
+    (info.warnings || []).forEach((w) => warns.add(w));
+    const r = await applyInfo(info, true);
+    set(`Прочитано файлов: ${ids.length}. Заполнено полей: ${r.filled}, позиций найдено: ${r.items}${r.added ? `, новых: ${r.added}` : ""}. Проверьте данные: распознавание может ошибаться.${warns.size ? " " + [...warns].join(". ") : ""}`);
+    if (!r.items) toast("Позиции не нашлись. Сделайте скриншот таблицы позиций крупнее или добавьте их вручную.");
+    loadDocs();
+  } catch (ex) {
+    set("");
+    toast(ex.message);
+  } finally { shotBusy = false; }
+}
+async function readPastedText(text, page) {
+  if (!T) return;
+  const id = T.id;
+  $("#shot-st").textContent = "Разбираю текст…";
+  try {
+    const { info } = await api("POST", `/api/tenders/${id}/import`, { text: String(text || "").slice(0, 2500000), html: String(page || "").slice(0, 1500000) });
+    if (!T || T.id !== id) return;
+    const r = await applyInfo(info, true);
+    $("#shot-st").textContent = `Заполнено полей: ${r.filled}, позиций найдено: ${r.items}${r.added ? `, новых: ${r.added}` : ""}. Проверьте данные.`;
+    $("#shot-ta").value = ""; $("#shot-text").hidden = true;
+  } catch (ex) { $("#shot-st").textContent = ""; toast(ex.message); }
+}
+document.addEventListener("paste", (e) => {
+  if ($("#new-shots") && viewList.create && e.clipboardData && e.clipboardData.files.length) {
+    // скриншот на главной: сразу новый тендер из него
+    e.preventDefault();
+    const files = [...e.clipboardData.files].map((f, i) => (f.name && f.name !== "image.png" ? f : new File([f], `скриншот-${i + 1}.png`, { type: f.type || "image/png" })));
+    viewList.create("", files).catch((ex) => toast(ex.message));
+    return;
+  }
+  if (!$("#shot-file") || !T) return;
+  const cd = e.clipboardData;
+  if (!cd) return;
+  const files = [...cd.files];
+  if (files.length) {
+    e.preventDefault();
+    readShots(files.map((f, i) => (f.name && f.name !== "image.png" ? f : new File([f], `скриншот-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}-${i + 1}.png`, { type: f.type || "image/png" }))));
+    return;
+  }
+  const el = e.target;
+  if (el && el.id !== "shot-ta" && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return; // обычная вставка в поле
+  const text = cd.getData("text/plain"), page = cd.getData("text/html");
+  if (text && text.trim().length > 40) { e.preventDefault(); readPastedText(text, page); }
+});
 
 /* документы */
 const kb = (n) => (n > 1048576 ? (n / 1048576).toFixed(1).replace(".", ",") + " МБ" : Math.max(1, Math.round(n / 1024)) + " КБ");

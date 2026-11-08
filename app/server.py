@@ -335,11 +335,18 @@ def update_docflags(tender_id):
     """Ищем в документах тендера «или эквивалент», СМП, нацрежим и т.п."""
     found = {}
     for d in q("SELECT name, path FROM docs WHERE tender_id=? AND status='ok'", (tender_id,)):
+        path = os.path.join(FILES, str(int(tender_id)), d["path"])
         try:
-            with open(os.path.join(FILES, str(int(tender_id)), d["path"]), "rb") as f:
+            with open(path, "rb") as f:
                 text = tparser.doc_text(d["name"], f.read(MAX_DOC))
         except OSError:
             continue
+        if not text.strip() and os.path.exists(path + ".read.json"):  # скриншот или скан: берём распознанный текст
+            try:
+                with open(path + ".read.json", encoding="utf-8") as f:
+                    text = part_text(json.load(f))
+            except (OSError, ValueError):
+                pass
         for k, v in tparser.flags(text).items():
             if k not in found or (k == "analogs" and v["value"] == "forbidden"):
                 v["doc"] = d["name"]
@@ -726,10 +733,11 @@ def api_tender_delete(h, user, tid):
     own_tender(user, tid)
     for d in q("SELECT path FROM docs WHERE tender_id=?", (int(tid),)):
         if d["path"]:
-            try:
-                os.remove(os.path.join(FILES, str(int(tid)), d["path"]))
-            except OSError:
-                pass
+            for suffix in ("", ".read.json"):
+                try:
+                    os.remove(os.path.join(FILES, str(int(tid)), d["path"]) + suffix)
+                except OSError:
+                    pass
     ex("DELETE FROM tenders WHERE id=? AND user_id=?", (int(tid), user["id"]))
     h.send_json({"ok": True})
 
@@ -737,7 +745,10 @@ def api_tender_delete(h, user, tid):
 @route("POST", r"/api/tenders/(\d+)/import")
 def api_tender_import(h, user, tid):
     own_tender(user, tid)
-    url = str(h.json_body().get("url") or "").strip()
+    b = h.json_body()
+    if b.get("docIds") or str(b.get("text") or "").strip() or str(b.get("html") or "").strip():
+        return import_from_files(h, int(tid), b)
+    url = str(b.get("url") or "").strip()
     try:
         final, headers, data = fetch(tparser.normalize_url(url))
         pages = [(final, decode_html(headers, data))]
@@ -760,10 +771,90 @@ def api_tender_import(h, user, tid):
     if info["textLength"] < 200:
         if any(host == d or host.endswith("." + d) for d in JS_HOSTS) and not RENDER_PY:
             raise ApiError(400, "Эта площадка работает на JavaScript. Включите на сервере встроенный браузер: запустите установку ещё раз и ответьте «да» на вопрос про сайты на JavaScript")
-        raise ApiError(400, "Страница почти пустая: площадка показывает закупку только после входа. Сделайте скриншоты или загрузите документы")
+        raise ApiError(400, "Площадка показывает закупку только после входа. Сделайте скриншоты страницы и загрузите их кнопкой «Скриншоты или файлы закупки» или вставьте через Ctrl+V")
     if info["docs"]:
         threading.Thread(target=download_docs, args=(int(tid), info["docs"]), daemon=True).start()
     info["url"] = url
+    h.send_json({"info": info})
+
+
+# ---------------------------------------------------------------- закупка со скриншотов, фото и файлов
+
+def doc_part(tid, d):
+    """Распознанное содержимое документа (кешируется рядом с файлом)."""
+    path = os.path.join(FILES, str(int(tid)), d["path"])
+    side = path + ".read.json"
+    try:
+        with open(side, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(path, "rb") as f:
+            data = f.read(MAX_UPLOAD)
+    except OSError:
+        return None
+    with _parse_lock:
+        try:
+            part = pricein.page_of(d["name"], data)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            part = {"html": "", "text": "", "rows": "", "warnings": ["Не получилось прочитать файл"]}
+    try:
+        with open(side, "w", encoding="utf-8") as f:
+            json.dump(part, f, ensure_ascii=False)
+    except OSError:
+        pass
+    return part
+
+
+def part_text(part):
+    """Простой текст распознанного документа (для поиска «эквивалент не допускается» и т.п.)."""
+    raw = "\n".join([part.get("text") or "", part.get("rows") or "", re.sub(r"<[^>]+>", " ", part.get("html") or "")])
+    return re.sub(r"[ \t]+", " ", raw)
+
+
+@route("POST", r"/api/tenders/(\d+)/read")
+def api_tender_read(h, user, tid):
+    """Скриншот, фото или документ закупки: сохраняем в документы тендера и распознаём."""
+    own_tender(user, tid)
+    if too_many(str(user["id"]), "parse", 150):
+        raise ApiError(429, "Слишком много загрузок за час. Попробуйте позже")
+    hit(str(user["id"]), "parse")
+    if int(h.headers.get("Content-Length") or 0) > MAX_PRICE_FILE:
+        raise ApiError(413, "Файл больше 25 МБ")
+    name = urllib.parse.unquote(h.headers.get("X-File-Name") or "скриншот.png")[:200]
+    data = h.body_bytes(MAX_PRICE_FILE)
+    if not data:
+        raise ApiError(400, "Пустой файл")
+    if q("SELECT COUNT(*) AS n FROM docs WHERE tender_id=?", (int(tid),), one=True)["n"] >= MAX_DOCS_PER_TENDER:
+        raise ApiError(400, "В тендере уже слишком много документов. Удалите лишние")
+    did = store_doc(int(tid), name, data)
+    part = doc_part(tid, q("SELECT * FROM docs WHERE id=?", (did,), one=True)) or {}
+    update_docflags(int(tid))
+    h.send_json({"id": did, "chars": len(part_text(part).strip()), "warnings": part.get("warnings", [])})
+
+
+def import_from_files(h, tid, b):
+    parts = []
+    ids = [int(x) for x in (b.get("docIds") or []) if str(x).isdigit()][:40]
+    for did in ids:
+        d = q("SELECT * FROM docs WHERE id=? AND tender_id=? AND status='ok'", (did, tid), one=True)
+        if d:
+            part = doc_part(tid, d)
+            if part:
+                parts.append(part)
+    text, page = str(b.get("text") or "")[:3000000], str(b.get("html") or "")[:3500000]
+    if text.strip() or page.strip():
+        parts.append({"text": text, "html": page, "rows": ""})
+    if not parts:
+        raise ApiError(400, "Нечего разбирать: загрузите скриншоты, файлы или вставьте текст")
+    with _parse_lock:
+        info = pricein.tender_from_parts(parts)
+    if info["textLength"] < 30 and not info["items"]:
+        raise ApiError(400, "Не получилось прочитать текст. Сделайте скриншот крупнее или загрузите документ")
+    info.update({"docs": [], "missingDocs": [], "url": "", "warnings": sorted({w for p in parts for w in p.get("warnings", [])})})
     h.send_json({"info": info})
 
 

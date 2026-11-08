@@ -30,6 +30,9 @@ h2 { font-size: 17px; }
 h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-3); font-weight: 600; }
 p { margin: 0; }
 button, input, select, textarea { font: inherit; color: inherit; }
+/* варианты в выпадающих списках: свой фон и цвет, иначе в тёмной теме светлый текст на белом */
+select option, select optgroup { background-color: var(--surface); color: var(--ink); }
+select option:disabled { color: var(--ink-3); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .muted { color: var(--ink-3); }
 .small { font-size: 13px; }
@@ -198,3 +201,6 @@ a.doc:hover { border-color: var(--accent); }
 .imp-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 14px 0 8px; }
 .items tr.off input:not([type="checkbox"]) { color: var(--ink-3); text-decoration: line-through; }
 .items input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--accent); }
+
+/* закупка со скриншотов и файлов */
+.shots { margin: -4px 0 14px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px; background: var(--surface-2); }
