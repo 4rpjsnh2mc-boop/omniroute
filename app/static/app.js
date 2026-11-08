@@ -293,7 +293,7 @@ async function viewList() {
     <div class="stats" id="stats"></div>
     <div class="row" id="flt" style="margin-bottom:12px"></div>
     <div class="card" style="padding:0"><div class="table-wrap" style="border:0">
-      <table class="list" style="min-width:900px"><thead><tr><th>Тендер</th><th>Подача до</th><th class="r">Закупка</th><th class="r">Наша цена</th><th class="r">Маржа</th><th>Следующий шаг</th><th>Статус</th></tr></thead><tbody id="t-body"><tr><td colspan="7" class="muted">Загрузка…</td></tr></tbody></table>
+      <table class="list" style="min-width:900px"><thead><tr><th>Тендер</th><th>Подача до</th><th class="r">Закупка</th><th class="r">Наша цена</th><th class="r">Маржа</th><th>Следующий шаг</th><th>Статус</th><th style="width:48px"></th></tr></thead><tbody id="t-body"><tr><td colspan="8" class="muted">Загрузка…</td></tr></tbody></table>
     </div></div>`;
   const create = async (url, files) => {
     const r = await api("POST", "/api/tenders", { title: url ? "Загрузка…" : "Новый тендер", data: newData() });
@@ -368,17 +368,29 @@ function renderList() {
     return fa - fb || b.updated - a.updated;
   });
   const body = $("#t-body");
-  if (!LIST.length) { body.innerHTML = `<tr><td colspan="7" class="muted" style="padding:18px">Тендеров пока нет. Вставьте ссылку на закупку выше.</td></tr>`; return; }
-  if (!rows.length) { body.innerHTML = `<tr><td colspan="7" class="muted" style="padding:18px">Под фильтр ничего не подходит.</td></tr>`; return; }
+  if (!LIST.length) { body.innerHTML = `<tr><td colspan="8" class="muted" style="padding:18px">Тендеров пока нет. Вставьте ссылку на закупку выше.</td></tr>`; return; }
+  if (!rows.length) { body.innerHTML = `<tr><td colspan="8" class="muted" style="padding:18px">Под фильтр ничего не подходит.</td></tr>`; return; }
   body.innerHTML = rows.map((t) => {
     const m = t.margin;
     const mp = m === null || m === undefined ? "—" : `<span class="pill ${m <= 0 ? "bad" : m >= num(SETTINGS.targetPct) ? "good" : "warn"}">${pct(m)}</span>`;
     const dl = t.deadline_ts ? `${esc(fmtMsk(t.deadline_ts))}<br><span class="pill ${urgency(t.deadline_ts)}">${esc(leftText(t.deadline_ts))}</span>` : esc(t.deadline || "—");
     return `<tr class="clickable" data-id="${t.id}"><td><div class="t-title">${t.important ? "★ " : ""}${esc(t.title || "Без названия")}</div><div class="t-meta">${esc([t.number, t.customer].filter(Boolean).join(" · "))}</div></td>
       <td class="small">${dl}</td><td class="r">${t.cost ? rub(t.cost) : "—"}</td><td class="r">${t.price ? rub(t.price) : "—"}</td><td class="r">${mp}</td>
-      <td><span class="pill neutral">${esc(t.stage || "Проверить тендер")}</span></td><td class="small">${esc(STATUSES[t.status] || "Расчёт")}</td></tr>`;
+      <td><span class="pill neutral">${esc(t.stage || "Проверить тендер")}</span></td><td class="small">${esc(STATUSES[t.status] || "Расчёт")}</td>
+      <td class="r" data-nonav><button class="icon" type="button" data-tdel="${t.id}" title="Удалить тендер" aria-label="Удалить тендер ${esc(t.title || "")}">×</button></td></tr>`;
   }).join("");
-  $$("#t-body tr[data-id]").forEach((tr) => tr.addEventListener("click", () => { location.hash = "#/t/" + tr.dataset.id; }));
+  $$("#t-body tr[data-id]").forEach((tr) => tr.addEventListener("click", (e) => {
+    if (e.target.closest("[data-nonav]")) return; // кнопка удаления не открывает тендер
+    location.hash = "#/t/" + tr.dataset.id;
+  }));
+  $$("#t-body [data-tdel]").forEach((b) => b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    confirmInline(b, "Удалить?", async () => {
+      await api("DELETE", "/api/tenders/" + b.dataset.tdel);
+      toast("Тендер удалён");
+      await viewList();
+    });
+  }));
 }
 async function copyText(text, input, okMsg = "Ссылка скопирована") {
   try { await navigator.clipboard.writeText(text); toast(okMsg); }
@@ -984,6 +996,7 @@ async function applyInfo(info, fromFiles) {
   if (info.appSecPct !== null && info.appSecPct !== undefined) d.adv.appSecPct = info.appSecPct;
   if (info.conSecPct !== null && info.conSecPct !== undefined) d.adv.conSecPct = info.conSecPct;
   if (info.advancePct !== null && info.advancePct !== undefined) d.adv.advancePct = info.advancePct;
+  if (info.paymentDays) d.adv.paymentDays = info.paymentDays;
   const days = parseDays(info.contractTerm);
   if (days) d.adv.contractDays = days;
   if (d.meta.law !== "44") d.adv.platformFee = d.adv.platformFee || 0;

@@ -111,7 +111,9 @@ class Page(HTMLParser):
             row, t["row"] = t["row"], None
             if any(row):
                 t["rows"].append(row)
-                if len(self.tstack) == 1:
+                # строки вложенных таблиц тоже отдельными строками: на B2B-Center всё извещение —
+                # таблица «подпись | значение» внутри ячейки таблицы-раскладки
+                if len(self.tstack) == 1 or (len(row) >= 2 and len(row[0]) < 200):
                     self.lines.append(" | ".join(row))
         elif tag == "table" and self.tstack:
             t = self.tstack.pop()
@@ -217,6 +219,7 @@ FIELDS = {
         r"срок подачи заявок",
     ],
     "place": [
+        r"адрес\w* мест\w* поставки",  # раньше общих: «Место поставки» бывает и шапкой таблицы позиций
         r"место поставки( товара)?(,? выполнения работ\w*)?(,? (или )?оказания услуг\w*)?",
         r"место выполнения( работ\w*)?(,? (или )?оказания услуг\w*)?",
         r"место оказания( услуг\w*)?",
@@ -226,6 +229,7 @@ FIELDS = {
     "appSec": [r"(размер )?обеспечени\w* заявк\w*"],
     "conSec": [r"(размер )?обеспечени\w* исполнени\w*( контракта| договора)?", r"обеспечени\w* договора"],
     "advance": [r"размер аванса", r"\bаванс\w*", r"предоплат\w*", r"условия оплаты"],
+    "payment": [r"условия оплаты", r"срок оплаты", r"порядок оплаты", r"сроки оплаты", r"оплата"],
     "contractTerm": [r"срок исполнения контракта", r"срок поставки", r"срок выполнения работ", r"срок исполнения договора"],
 }
 
@@ -332,7 +336,7 @@ def items_from_tables(tables):
                 continue
             unit_i = _idx(h, r"ед\.?\s*изм|единиц")
             price_i = _idx(h, r"цена\s*(за\s*)?ед|цена единиц|цена,|цена\b")
-            info_i = _idx(h, r"дополнительн|характеристик")
+            info_i = _idx(h, r"дополнительн|характеристик|требовани")
             need = max(i for i in (name_i, qty_i, unit_i, price_i, info_i) if i is not None)
             out = []
             for r in rows[hi + 1:]:
@@ -484,6 +488,31 @@ def detect_number(url, lines):
     return ""
 
 
+H1_JUNK_RE = re.compile(r"зарегистрир|избранн|авторизу|войдите|войти|подписат", re.I)
+H1_NUMBER_RE = re.compile(r"^(запрос\w* (предложений|котировок|цен)|аукцион\w*|конкурс\w*|тендер\w*|закупк\w*|процедур\w*|лот)\s*№\s*[\w-]+$", re.I)
+
+
+def clean_h1(h1):
+    """Заголовок страницы без служебных кусков: «Запрос предложений № 1», «Зарегистрируйтесь, чтобы…»."""
+    parts = [norm(p) for p in re.split(r"\s*[\n\t]\s*|\s{3,}", h1 or "") if norm(p)]
+    keep = [p for p in parts if not H1_JUNK_RE.search(p) and not H1_NUMBER_RE.match(p)]
+    if not keep:
+        return norm(h1)
+    return max(keep, key=len) if len(parts) > 1 else keep[0]
+
+
+PAY_DAYS_RE = re.compile(r"(\d{1,3})\s*(?:\([а-я ]+\)\s*)?(календарн\w*|рабоч\w*|банковск\w*)?\s*(дн|день|дня)")
+
+
+def payment_days(v):
+    """«Оплата в течение 90 дней после поставки» → 90; рабочие дни пересчитываем в календарные."""
+    m = PAY_DAYS_RE.search((v or "").lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    return round(n * 1.4) if m.group(2) and not m.group(2).startswith("календ") else n
+
+
 def extract(pages, url):
     """pages: список (url, html). Возвращает словарь с полями закупки, позициями и документами."""
     lines, tables, links, title = [], [], [], ""
@@ -529,11 +558,12 @@ def extract(pages, url):
 
     h1 = ""
     for purl, text in pages[:1]:
-        h1 = norm(parse_html(text).h1)
-    subject = find_value(lines, FIELDS["subject"], IS_TEXT) or h1 or (max(title.split(" - "), key=len) if title else "")
+        h1 = clean_h1(parse_html(text).h1)
+    subject = find_value(lines, FIELDS["subject"], IS_TEXT) or h1 or (max(re.split(r" [-—] ", title), key=len) if title else "")
     customer = norm(find_value(lines, FIELDS["customer"], IS_TEXT) or "")[:300]
     if not customer:  # организатор без подписи, как на Bidzaar
-        org = next((l for l in lines[:200] if re.match(r"^(ООО|АО|ПАО|ЗАО|ОАО|НАО|ИП|ГК|ФГУП|ФГБУ|ГБУ|МУП|ГУП)\s+[«\"A-ZА-ЯЁ]", l) and len(l) < 160), "")
+        org = next((l for l in lines[:200] if re.match(r"^(ООО|АО|ПАО|ЗАО|ОАО|НАО|ИП|ГК|ФГУП|ФГБУ|ГБУ|МУП|ГУП)\s+[«\"A-ZА-ЯЁ]", l)
+                    and len(l) < 160 and not re.search(r"©|\(c\)|все права|площадк", l, re.I)), "")  # не подвал сайта
         customer = norm(org)
     return {
         "flags": flags(full),
@@ -549,6 +579,7 @@ def extract(pages, url):
         "appSecPct": sec_pct(find_value(lines, FIELDS["appSec"], HAS_NUM), nmck),
         "conSecPct": sec_pct(find_value(lines, FIELDS["conSec"], HAS_NUM), nmck),
         "advancePct": advance,
+        "paymentDays": payment_days(find_value(lines, FIELDS["payment"], lambda v: bool(PAY_DAYS_RE.search(v.lower())))),
         "items": items[:300],
         "docs": uniq[:25],
         "missingDocs": missing[:20],
@@ -561,6 +592,8 @@ def extra_pages(url):
     u = urllib.parse.urlsplit(url)
     if u.hostname and u.hostname.endswith("zakupki.gov.ru") and "common-info" in u.path:
         return [urllib.parse.urlunsplit(u._replace(path=u.path.replace("common-info", "documents")))]
+    if u.hostname and u.hostname.endswith("b2b-center.ru") and re.search(r"/market/.+/tender-\d+", u.path) and "action=" not in u.query:
+        return [urllib.parse.urlunsplit(u._replace(query="action=positions", fragment=""))]  # вкладка «Закупочные позиции»
     return []
 
 
@@ -574,8 +607,10 @@ def _snip(text, m, width=90):
 
 FLAG_RULES = [
     # (ключ, regex, значение)
-    ("analogs", r"эквивалент\w*\s+не\s+(допуска|предусмотр)|без\s+(возможности\s+)?(поставки\s+)?эквивалент|не\s+допускается\s+(поставка\s+)?эквивалент", "forbidden"),
-    ("analogs", r"или\s+эквивалент|допуска\w*\s+(поставка\s+)?эквивалент|эквивалент\w*\s+допуска|возможн\w+\s+поставк\w+\s+эквивалент", "allowed"),
+    ("analogs", r"эквивалент\w*\s+не\s+(допуска|предусмотр)|без\s+(возможности\s+)?(поставки\s+)?эквивалент|не\s+допускается\s+(поставка\s+)?эквивалент|"
+                r"аналог\w*\s+не\s+(допуска|рассматрива|принима)|только\s+производител|только\s+(оригинал|бренд)|строго\s+(производител|бренд)", "forbidden"),
+    ("analogs", r"или\s+эквивалент|допуска\w*\s+(поставка\s+)?эквивалент|эквивалент\w*\s+допуска|возможн\w+\s+поставк\w+\s+эквивалент|"
+                r"разрешена\s+подача\s+аналог\w*[^|\n]{0,40}\|\s*да|аналог\w*\s+допуска|допуска\w*\s+аналог", "allowed"),
     ("smp", r"только\s+(для\s+)?субъект\w+\s+мал|участник\w*\s+(закупки\s+)?могут\s+быть\s+только\s+субъект\w+\s+мал|субъект\w+\s+малого\s+и\s+среднего\s+предпринимательства|\bсмп\b|\bсонко\b", True),
     ("national", r"национальн\w+\s+режим|запрет\w*\s+(на\s+)?допуск|ограничени\w+\s+допуска|услови\w+\s+допуска|постановлени\w+\s+правительства\s+рф\s+№\s*1875|пп\s*рф\s*№?\s*1875|приказ\w*\s+минфина\s+№?\s*126н", True),
     ("trademark", r"товарн\w+\s+знак", True),

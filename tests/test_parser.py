@@ -89,6 +89,37 @@ class NumbersTest(unittest.TestCase):
         self.assertEqual(P.sec_pct("50 000,00 ₽", 1000000), 5.0)
 
 
+class B2BCenterTest(unittest.TestCase):
+    """Извещение B2B-Center — таблица «подпись | значение» внутри таблицы-раскладки; позиции на отдельной вкладке."""
+    URL = "https://www.b2b-center.ru/market/zakupka-maslo-gidravlicheskoe-hlp-32-gazpromneft/tender-4671957/"
+
+    def setUp(self):
+        pos = P.extra_pages(self.URL)
+        self.assertEqual(pos, [self.URL + "?action=positions"])
+        self.r = P.extract([(self.URL, fx("b2b_notice.html")), (pos[0], fx("b2b_positions.html"))], self.URL)
+
+    def test_fields(self):
+        r = self.r
+        self.assertEqual(r["number"], "4671957")
+        self.assertEqual(r["subject"], "Закупка масло гидравлическое HLP 32 (Газпромнефть)")
+        self.assertEqual(r["customer"], 'ООО "ВКМ-СТАЛЬ"')
+        self.assertEqual(r["deadline"], "12.11.2026 16:00")
+        self.assertIn("г. Саранск", r["place"])
+        self.assertEqual(r["paymentDays"], 90)
+        self.assertIsNone(r["nmck"])
+
+    def test_items_and_brand_lock(self):
+        self.assertEqual(self.r["items"], [{"name": "Масло гидравлическое HLP 32 (только производитель - Газпромнефть)",
+                                            "unit": "л", "qty": 5330.0, "nmckUnit": None}])
+        self.assertEqual(self.r["flags"]["analogs"]["value"], "forbidden")
+
+    def test_clean_h1(self):
+        self.assertEqual(P.clean_h1("Запрос предложений № 4671957\n\tЗарегистрируйтесь, чтобы сохранять процедуры в Избранное\n Закупка масла"),
+                         "Закупка масла")
+        self.assertEqual(P.clean_h1("Поставка щебня"), "Поставка щебня")
+        self.assertEqual(P.payment_days("Оплата в течение 10 рабочих дней"), 14)
+
+
 if __name__ == "__main__":
     unittest.main()
 

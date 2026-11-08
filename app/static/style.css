@@ -204,3 +204,7 @@ a.doc:hover { border-color: var(--accent); }
 
 /* закупка со скриншотов и файлов */
 .shots { margin: -4px 0 14px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px; background: var(--surface-2); }
+
+/* удаление тендера из списка: «Удалить? Да Нет» в одну строку */
+.list td[data-nonav] .row { flex-wrap: nowrap; justify-content: flex-end; gap: 6px; }
+.list td[data-nonav] .row .small { white-space: nowrap; }
