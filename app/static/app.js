@@ -230,7 +230,7 @@ async function route() {
   if ((km = h.match(/^#\/key\/([\w-]{10,100})/))) return claimKey(km[1]);
   if (!ME) { const jm = h.match(/^#\/join\/([\w-]{4,100})/); return showStart(jm ? jm[1] : ""); }
   if (h.startsWith("#/join/")) { history.replaceState(null, "", location.pathname + "#/"); }
-  const page = h.startsWith("#/t/") ? "list" : h.startsWith("#/prices") ? "prices" : h.startsWith("#/settings") ? "settings" : "list";
+  const page = h.startsWith("#/t/") ? "list" : h.startsWith("#/prices") ? "prices" : h.startsWith("#/settings") ? "settings" : h.startsWith("#/help") ? "help" : "list";
   $$("#nav a").forEach((a) => a.classList.toggle("on", a.dataset.nav === page));
   window.scrollTo(0, 0);
   let m;
@@ -238,6 +238,7 @@ async function route() {
     if ((m = h.match(/^#\/t\/(\d+)/))) return await viewTender(Number(m[1]));
     if (page === "prices") return await viewPrices();
     if (page === "settings") return viewSettings();
+    if (page === "help") return viewHelp((h.split("/")[2] || "platforms"));
     return await viewList();
   } catch (e) {
     if (ME) app.innerHTML = `<div class="card"><p class="err-msg">${esc(e.message)}</p><p><a href="#/">К списку тендеров</a></p></div>`;
@@ -262,7 +263,7 @@ function newData() {
   const s = SETTINGS || {};
   return {
     v: 1,
-    meta: { number: "", customer: "", subject: "", deadline: "", deadlineAt: "", place: "", url: "", law: "44", contractTerm: "" },
+    meta: { number: "", customer: "", subject: "", deadline: "", deadlineAt: "", place: "", url: "", law: "commercial", contractTerm: "" },
     nmck: 0, items: [], supplierVat: s.supplierVat !== false, delivery: 0, other: 0, overheadPct: s.overheadPct ?? 5,
     adv: { appSecPct: 0, appDays: 20, conSecPct: 0, secMethod: "bg", bgRatePct: s.bgRatePct ?? 3, contractDays: 30, paymentDays: 10, advancePct: 0, moneyRatePct: s.moneyRatePct ?? 18, platformFee: 0 },
     tax: { ...(s.tax || { regime: "osno", usnVat: 0, usnRate: 6, profitRate: 25 }) },
@@ -310,6 +311,7 @@ async function viewList() {
     $("#w-close").onclick = () => { JUST_JOINED = false; viewList(); };
   }
   const [{ tenders }, { reminders }] = await Promise.all([api("GET", "/api/tenders"), api("GET", "/api/reminders")]);
+  if (!$("#soon")) return; // пока грузилось, открыли другой раздел
   LIST = tenders;
   const soon = reminders.filter((r) => !r.sent && r.at - Date.now() / 1000 < 3 * 86400).slice(0, 5);
   const hot = tenders.filter((t) => t.deadline_ts && t.deadline_ts > Date.now() / 1000 && t.deadline_ts - Date.now() / 1000 < 3 * 86400 && ["draft", "submitted"].includes(t.status));
@@ -488,6 +490,7 @@ async function viewTender(id) {
           ${F("meta.customer", "Заказчик", { wide: true })}
           ${F("meta.place", "Место поставки", { wide: true })}
         </div>
+        <p class="note small" id="law-tip" style="margin-top:12px"></p>
       </section>
 
       <section class="card" id="risk-card">
@@ -572,6 +575,7 @@ async function viewTender(id) {
   renderStages();
   loadReminders();
   loadMarket();
+  renderLawTip();
   $("#ics").onclick = exportIcs;
   $("#note-copy").onclick = () => copyText(noteText(), null, "Сводка скопирована");
   $("#mk-run").onclick = runMarket;
@@ -632,6 +636,7 @@ function onField(e) {
   if (el.dataset.k.startsWith("tax.")) syncTaxFields();
   if (el.dataset.k === "supplierVat") updateItemCells();
   if (el.dataset.k === "meta.deadlineAt") renderStages();
+  if (el.dataset.k === "meta.law" || el.dataset.k === "meta.url") renderLawTip();
   if (el.dataset.k === "meta.deadline" && !T.data.meta.deadlineAt) { T.data.meta.deadlineAt = parseDeadline(el.value); $("#f-meta-deadlineAt").value = T.data.meta.deadlineAt; renderStages(); }
   if (el.dataset.k === "note") { changed(); return; }
   recalc();
@@ -954,7 +959,7 @@ async function runImport(url) {
     d.inn = info.inn || d.inn || "";
     if (info.deadline) { d.meta.deadlineAt = parseDeadline(info.deadline) || d.meta.deadlineAt; }
     d.bid = { mode: "target" };
-    fillFields(); renderItems(); recalc(); renderStages(); changed(); await saveNow();
+    fillFields(); renderItems(); recalc(); renderStages(); renderLawTip(); changed(); await saveNow();
     $("#imp-btn").textContent = "Обновить с площадки";
     const found = info.items ? info.items.length : 0;
     st.textContent = `Загружено: ${found} ${plural(found, "позиция", "позиции", "позиций")}, документов найдено: ${info.docs.length}`;
@@ -973,7 +978,7 @@ async function loadDocs() {
   const id = T.id;
   let r;
   try { r = await api("GET", `/api/tenders/${id}/docs`); } catch (e) { return; }
-  if (!T || T.id !== id) return;
+  if (!T || T.id !== id || !$("#docs")) return;
   const list = $("#docs");
   list.innerHTML = r.docs.map((x) => x.status === "ok"
     ? `<div class="doc"><a href="/api/tenders/${id}/docs/${x.id}">${esc(x.name)}</a><span class="small muted">${kb(x.size)}</span><button class="icon" type="button" data-doc="${x.id}" aria-label="Удалить документ">×</button></div>`
@@ -1007,6 +1012,13 @@ async function uploadDocs(e) {
   loadDocs();
 }
 
+function renderLawTip() {
+  const el = $("#law-tip");
+  if (!el || !T) return;
+  const pl = T.data.meta.url ? platformOf(T.data.meta.url) : null;
+  el.innerHTML = (pl ? `Площадка: <a href="${esc(pl.url)}" target="_blank" rel="noopener">${esc(pl.name)}</a>. ${esc(pl.note)}<br>` : "") + lawTip(T.data.meta.law);
+}
+
 /* ---------- работа с тендером: этапы, напоминания, календарь, сводка ---------- */
 let marketTimer = 0;
 function renderStages() {
@@ -1023,7 +1035,7 @@ async function loadReminders() {
   const id = T.id;
   let r;
   try { r = await api("GET", `/api/tenders/${id}/reminders`); } catch (e) { return; }
-  if (!T || T.id !== id) return;
+  if (!T || T.id !== id || !$("#rem-list")) return;
   $("#rem-list").innerHTML = r.reminders.map((x) => `<div class="doc"><span class="name">${x.sent ? "✓ " : "⏰ "}${esc(x.text || "Напоминание")}<br><span class="small muted">${esc(fmtMsk(x.at))}</span></span><button class="icon" type="button" data-rem="${x.id}" aria-label="Удалить напоминание">×</button></div>`).join("")
     || `<p class="small muted">Напоминаний нет.</p>`;
   $("#rem-list").onclick = async (e) => {
@@ -1033,7 +1045,9 @@ async function loadReminders() {
   };
   if (!$("#rem-at").value) $("#rem-at").value = tsMsk(Math.floor(Date.now() / 1000) + 86400).slice(0, 11) + "10:00";
   api("GET", "/api/telegram").then((tg) => {
-    $("#rem-hint").innerHTML = tg.linked ? "Напоминания придут в Telegram. За сутки и за 3 часа до окончания подачи Telegram напомнит сам."
+    const hint = $("#rem-hint");
+    if (!hint) return;
+    hint.innerHTML = tg.linked ? "Напоминания придут в Telegram. За сутки и за 3 часа до окончания подачи Telegram напомнит сам."
       : tg.enabled ? 'Чтобы напоминания приходили на телефон, подключите Telegram в <a href="#/settings">Настройках</a>. Или нажмите «В календарь».'
       : "Напоминания видны на главной странице. Чтобы получать их на телефон, нажмите «В календарь».";
   }).catch(() => {});
@@ -1117,7 +1131,7 @@ async function loadMarket() {
   const id = T.id;
   let r;
   try { r = await api("GET", `/api/tenders/${id}/market`); } catch (e) { return; }
-  if (!T || T.id !== id) return;
+  if (!T || T.id !== id || !$("#mk-job")) return;
   const job = r.job;
   $("#mk-job").textContent = job && job.running ? `${job.text || "Ищу"}… (${job.done || 0} из ${job.total || "?"})` : job && job.error ? job.error : "";
   $("#mk-run").disabled = !!(job && job.running);
@@ -1128,6 +1142,7 @@ async function loadMarket() {
 }
 function renderMarket() {
   const mk = T.market, box = $("#mk-out");
+  if (!box) return;
   if (!mk) { box.innerHTML = `<p class="small muted">Нажмите «Найти в ЕИС». Поиск идёт на сервере и займёт 1–3 минуты.</p>`; return; }
   const st = (s) => (s ? `<b>${rub2(s.median)}</b><br><span class="small muted">${rub2(s.min)} – ${rub2(s.max)} · ${s.n} ${plural(s.n, "контракт", "контракта", "контрактов")}</span>` : `<span class="muted">нет данных</span>`);
   const suppliers = {};
@@ -1223,9 +1238,11 @@ async function viewPrices() {
 
 /* ---------- настройки ---------- */
 async function renderTg() {
-  const box = $("#tg-card");
   let tg;
-  try { tg = await api("GET", "/api/telegram"); } catch (e) { box.hidden = true; return; }
+  try { tg = await api("GET", "/api/telegram"); } catch (e) { tg = null; }
+  const box = $("#tg-card");
+  if (!box) return;
+  if (!tg) { box.hidden = true; return; }
   if (!tg.enabled) { box.innerHTML = `<div class="card-h"><h2>Напоминания в Telegram</h2></div><p class="muted small">Telegram-бот на сервере не подключён. Напоминания видны на главной странице, а срок можно добавить в календарь телефона кнопкой «В календарь» в тендере.</p>`; return; }
   box.innerHTML = `<div class="card-h"><h2>Напоминания в Telegram</h2></div>
     ${tg.linked ? `<p>Telegram подключён. Сюда придут ваши напоминания, а за сутки и за 3 часа до окончания подачи придёт напоминание о сроке.</p>

@@ -23,6 +23,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -43,6 +44,8 @@ DB_PATH = os.path.join(DATA, "app.db")
 INVITE = os.environ.get("TENDER_INVITE", "").strip()
 TG_TOKEN = os.environ.get("TENDER_TG_TOKEN", "").strip()
 PUBLIC_URL = os.environ.get("TENDER_PUBLIC_URL", "").strip().rstrip("/")
+RENDER_PY = os.environ.get("TENDER_RENDER", "").strip()  # python из venv с Playwright: открывает сайты на JavaScript
+JS_HOSTS = ("bidzaar.com",)  # площадки, которые без JavaScript показывают пустую страницу
 FILES = os.path.join(DATA, "files")
 COOKIE_DAYS = 400
 COOKIE = "tsid"
@@ -292,6 +295,27 @@ def filename_from_headers(headers):
         except UnicodeEncodeError:
             return raw
     return ""
+
+
+_render_lock = threading.Semaphore(1)  # браузер тяжёлый: по одной странице за раз
+
+
+def render_html(url):
+    """HTML страницы после выполнения JavaScript или None, если браузер не установлен или не справился."""
+    if not RENDER_PY or not os.path.exists(RENDER_PY):
+        return None
+    _check_url(url)
+    with _render_lock:
+        try:
+            r = subprocess.run([RENDER_PY, os.path.join(BASE, "render.py"), url], capture_output=True, timeout=90,
+                               env={**os.environ, "HOME": DATA})
+        except (subprocess.TimeoutExpired, OSError) as e:
+            sys.stderr.write(f"render {url}: {e!r}\n")
+            return None
+    if r.returncode != 0 or not r.stdout:
+        sys.stderr.write(f"render {url}: code {r.returncode} {r.stderr[-500:]!r}\n")
+        return None
+    return r.stdout[:MAX_PAGE].decode("utf-8", "replace")
 
 
 # ---------------------------------------------------------------- документы (фоновая загрузка)
@@ -619,6 +643,8 @@ def api_profile(h, user):
                 s[k] = v
         if "supplierVat" in st:
             s["supplierVat"] = bool(st["supplierVat"])
+        if isinstance(st.get("myPlatforms"), list):
+            s["myPlatforms"] = [str(x)[:40] for x in st["myPlatforms"][:200] if re.fullmatch(r"[a-z0-9-]{1,40}", str(x))]
         ex("UPDATE users SET settings=? WHERE id=?", (json.dumps(s, ensure_ascii=False), user["id"]))
     u = q("SELECT * FROM users WHERE id=?", (user["id"],), one=True)
     h.send_json({"user": public_user(u), "settings": get_settings(u)})
@@ -712,7 +738,7 @@ def api_tender_import(h, user, tid):
     own_tender(user, tid)
     url = str(h.json_body().get("url") or "").strip()
     try:
-        final, headers, data = fetch(url)
+        final, headers, data = fetch(tparser.normalize_url(url))
         pages = [(final, decode_html(headers, data))]
         for extra in tparser.extra_pages(final):
             try:
@@ -723,8 +749,17 @@ def api_tender_import(h, user, tid):
     except FetchError as e:
         raise ApiError(400, str(e))
     info = tparser.extract(pages, final)
+    host = (urllib.parse.urlsplit(final).hostname or "").lower()
+    if info["textLength"] < 400 or not info["items"] and any(host == d or host.endswith("." + d) for d in JS_HOSTS):
+        html = render_html(final)
+        if html:
+            rendered = tparser.extract([(final, html)] + pages[1:], final)
+            if rendered["textLength"] > info["textLength"]:
+                info = rendered
     if info["textLength"] < 200:
-        raise ApiError(400, "Страница почти пустая: площадка показывает закупку только после входа")
+        if any(host == d or host.endswith("." + d) for d in JS_HOSTS) and not RENDER_PY:
+            raise ApiError(400, "Эта площадка работает на JavaScript. Включите на сервере встроенный браузер: запустите установку ещё раз и ответьте «да» на вопрос про сайты на JavaScript")
+        raise ApiError(400, "Страница почти пустая: площадка показывает закупку только после входа. Сделайте скриншоты или загрузите документы")
     if info["docs"]:
         threading.Thread(target=download_docs, args=(int(tid), info["docs"]), daemon=True).start()
     info["url"] = url

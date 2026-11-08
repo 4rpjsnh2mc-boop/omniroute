@@ -203,12 +203,14 @@ FIELDS = {
         r"^заказчик\w*\s*(\||:)",
         r"^организаци\w*,? осуществляющ\w* размещение",
         r"^название организации",
-        r"^организатор\w*( торгов| закупки)?\s*:?$",
+        r"^организатор\w*( торгов| закупки| конкурса| запроса)?\s*:?$",
     ],
     "deadline": [
         r"дата и время окончания (срока )?подачи заявок",
         r"окончани\w* (срока )?подачи заявок",
         r"при[её]м заявок\s*(до)?",
+        r"при[её]м предложений\s*(до)?",
+        r"окончани\w* при[её]ма предложений",
         r"подать заявку до",
         r"срок подачи заявок",
     ],
@@ -352,6 +354,24 @@ def items_from_tables(tables):
     return best
 
 
+LIST_ITEM_RE = re.compile(r"^(\d{1,3})\.\s+(\S.{2,250})$")
+LIST_QTY_RE = re.compile(r"^(\d+(?:[.,]\d+)?)\s*([A-Za-zА-Яа-яЁё²³0-9.\-]{1,15})\.?$")
+
+
+def items_from_list(lines):
+    """Bidzaar и похожие: «1. Название» и на следующей строке «5 шт.»."""
+    items = []
+    for i, line in enumerate(lines[:-1]):
+        m = LIST_ITEM_RE.match(line)
+        if not m:
+            continue
+        q = LIST_QTY_RE.match(lines[i + 1].strip())
+        if not q:
+            continue
+        items.append({"name": clean_name(m.group(2))[:240], "unit": q.group(2).rstrip("."), "qty": float(q.group(1).replace(",", ".")), "nmckUnit": None})
+    return items
+
+
 def items_from_pairs(lines):
     """Росэлторг и похожие: «Наименование | …», «Количество | …», «Ед. измерения | …»."""
     items, cur = [], None
@@ -385,6 +405,18 @@ DOC_PATH_RE = re.compile(r"(download|getfile|get_file|attach|filestore|/files?/|
 FILE_NAME_RE = re.compile(r"[^\s/\\|*\"<>\[\]();:]{1,80}(?:[ \t][^\s/\\|*\"<>\[\]();:]{1,40}){0,8}\.(?:docx?|pdf|xlsx?|rtf|zip|rar|7z|odt)\b", re.I)
 
 
+ICON_WORDS = r"(picture_as_pdf|insert_drive_file|description|attach_file|get_app|visibility|archive|cloud_download|file_download|download)"
+
+
+def clean_doc_name(name):
+    n = re.sub(r"^(" + ICON_WORDS + r"\s+)+", "", norm(name), flags=re.I)
+    m = re.match(r"^(.*?)\s+(pdf|docx?|xlsx?|zip|rar|rtf|txt|odt|ods|7z)\s+[\d.,]+\s*(кб|мб|kb|mb|байт)\b", n, re.I)
+    if m:
+        n = f"{m.group(1)}.{m.group(2).lower()}"
+    n = re.sub(r"\s+" + ICON_WORDS + r"$", "", n, flags=re.I)
+    return n.strip()
+
+
 def doc_links(links, base_url):
     out, seen = [], set()
     for l in links:
@@ -394,7 +426,9 @@ def doc_links(links, base_url):
         url = urllib.parse.urljoin(base_url, href)
         if not url.startswith(("http://", "https://")) or url in seen:
             continue
-        name = l.get("title") or l.get("text") or ""
+        name = clean_doc_name(l.get("title") or l.get("text") or "")
+        if re.match(r"скачать\s+все", name, re.I):
+            continue
         if not (DOC_EXT_RE.search(url) or DOC_PATH_RE.search(url) or FILE_NAME_RE.search(name)):
             continue
         if re.search(r"/(search|region|organizator|help|faq|news)/", url, re.I):
@@ -442,7 +476,7 @@ def detect_number(url, lines):
     if m:
         return m.group(1)
     for line in lines[:80]:
-        m = re.search(r"(?:№|номер[^\d]{0,20})\s*([0-9A-Za-zА-Яа-я-]{6,30})", line)
+        m = re.search(r"(?:№|номер[^\d]{0,20}|^код:?)\s*([0-9A-Za-zА-Яа-я-]{6,30})", line, re.I)
         if m:
             return m.group(1)
     return ""
@@ -477,6 +511,8 @@ def extract(pages, url):
     items = items_from_tables(tables)
     if not items:
         items = items_from_pairs(lines)
+    if not items:
+        items = items_from_list(lines)
 
     docs = []
     for l in links:
@@ -494,6 +530,9 @@ def extract(pages, url):
         h1 = norm(parse_html(text).h1)
     subject = find_value(lines, FIELDS["subject"], IS_TEXT) or h1 or (max(title.split(" - "), key=len) if title else "")
     customer = norm(find_value(lines, FIELDS["customer"], IS_TEXT) or "")[:300]
+    if not customer:  # организатор без подписи, как на Bidzaar
+        org = next((l for l in lines[:200] if re.match(r"^(ООО|АО|ПАО|ЗАО|ОАО|НАО|ИП|ГК|ФГУП|ФГБУ|ГБУ|МУП|ГУП)\s+[«\"A-ZА-ЯЁ]", l) and len(l) < 160), "")
+        customer = norm(org)
     return {
         "flags": flags(full),
         "inn": find_inn(customer, full[:20000]),
@@ -701,3 +740,16 @@ def doc_text(name, data, limit=400000):
     except Exception:
         return ""
     return ""
+
+
+def normalize_url(url):
+    """Ссылки, которые открываются только после входа, меняем на публичные версии тех же страниц."""
+    u = urllib.parse.urlsplit(url)
+    host = (u.hostname or "").lower()
+    if host.endswith("tender.pro"):
+        m = re.search(r"(?:tenderid=|/tender/)(\d{5,})", url, re.I)
+        if m:
+            return f"https://www.tender.pro/api/tender/{m.group(1)}/view_public"
+    if host.endswith("bidzaar.com") and u.path.startswith("/process/"):
+        return urllib.parse.urlunsplit(u._replace(path="/app" + u.path))
+    return url

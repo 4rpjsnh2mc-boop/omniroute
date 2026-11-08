@@ -99,6 +99,35 @@ if ! grep -q '^TENDER_TG_TOKEN=' "$ENV_FILE"; then
   fi
   [ -n "$TG" ] && set_env TENDER_TG_TOKEN "$TG"
 fi
+install_browser() {
+  say "Ставлю встроенный браузер (несколько минут)"
+  if apt-get install -y python3-venv >/dev/null \
+     && python3 -m venv "$APP_DIR/venv" \
+     && "$APP_DIR/venv/bin/pip" install -q --upgrade pip playwright \
+     && PLAYWRIGHT_BROWSERS_PATH="$APP_DIR/browsers" "$APP_DIR/venv/bin/playwright" install --with-deps chromium; then
+    chmod -R a+rX "$APP_DIR/venv" "$APP_DIR/browsers"
+    set_env TENDER_RENDER "$APP_DIR/venv/bin/python"
+    set_env PLAYWRIGHT_BROWSERS_PATH "$APP_DIR/browsers"
+    ok "Браузер установлен: Bidzaar и другие сайты на JavaScript открываются"
+  else
+    echo "Браузер поставить не удалось. Калькулятор работает и без него, кроме сайтов на JavaScript (Bidzaar)."
+    echo "При следующем запуске установки я предложу ещё раз."
+  fi
+}
+if ! grep -q '^TENDER_RENDER=' "$ENV_FILE"; then
+  echo
+  echo "Некоторые площадки (например, Bidzaar) показывают закупку только в браузере."
+  echo "Чтобы калькулятор открывал их сам, нужен встроенный браузер Chromium (около 500 МБ на диске)."
+  ANS="$(ask 'Поставить встроенный браузер? [Д/н]: ' | tr -d '[:space:]')"
+  case "$ANS" in
+    н*|Н*|n*|N*) set_env TENDER_RENDER "" ;;
+    *) install_browser ;;
+  esac
+elif [ -x "$APP_DIR/venv/bin/python" ]; then
+  "$APP_DIR/venv/bin/pip" install -q --upgrade playwright >/dev/null 2>&1 \
+    && PLAYWRIGHT_BROWSERS_PATH="$APP_DIR/browsers" "$APP_DIR/venv/bin/playwright" install chromium >/dev/null 2>&1 \
+    && chmod -R a+rX "$APP_DIR/venv" "$APP_DIR/browsers" || true
+fi
 chown root:tender "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 

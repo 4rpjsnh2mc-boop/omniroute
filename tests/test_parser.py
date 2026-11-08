@@ -91,3 +91,26 @@ class NumbersTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BidzaarTest(unittest.TestCase):
+    URL = "https://bidzaar.com/app/process/light/019f3736-8a69-7593-bc64-c65f447ddbc1"
+
+    def test_rendered_page(self):
+        r = P.extract([(self.URL, fx("bidzaar.html"))], self.URL)
+        self.assertEqual(r["number"], "350-009")
+        self.assertIn("Медиа Бизнес Солюшенс", r["customer"])
+        self.assertIn("14.08.2026", r["deadline"])
+        self.assertEqual(len(r["items"]), 6)
+        self.assertEqual((r["items"][0]["qty"], r["items"][0]["unit"]), (5.0, "шт"))
+        names = [d["name"] for d in r["docs"]]
+        self.assertIn("02 Приложение №2 - ТЗ Серверы LLM (виртуализация).pdf", names)
+        self.assertFalse(any("Скачать все" in n for n in names))
+
+
+class UrlTest(unittest.TestCase):
+    def test_normalize(self):
+        self.assertEqual(P.normalize_url("https://www.tender.pro/view_tender.shtml?sid=&tenderid=1217841"),
+                         "https://www.tender.pro/api/tender/1217841/view_public")
+        self.assertEqual(P.normalize_url("https://bidzaar.com/process/light/abc"), "https://bidzaar.com/app/process/light/abc")
+        self.assertEqual(P.normalize_url("https://www.roseltorg.ru/procedure/B1"), "https://www.roseltorg.ru/procedure/B1")
